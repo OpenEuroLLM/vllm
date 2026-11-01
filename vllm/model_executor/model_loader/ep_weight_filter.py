@@ -65,12 +65,24 @@ def compute_local_expert_ids(
         raise ValueError(f"Unknown expert placement strategy: {placement}")
 
 
+_SKIPPED_WEIGHT_NAMES: set[str] = set()
+
+
+def skip_weight_name(weight_name: str) -> None:
+    """Never read *weight_name* from the checkpoint (a model that maps the tensor
+    itself, e.g. a table kept on the host)."""
+    _SKIPPED_WEIGHT_NAMES.add(weight_name)
+
+
 def should_skip_weight(
     weight_name: str,
     local_expert_ids: set[int] | None,
 ) -> bool:
     """Return ``True`` if *weight_name* is an expert weight that does not
-    belong to the local rank and should be skipped during loading."""
+    belong to the local rank, or was registered with ``skip_weight_name``, and
+    should be skipped during loading."""
+    if weight_name in _SKIPPED_WEIGHT_NAMES:
+        return True
     if local_expert_ids is None:
         return False
     eid = parse_expert_id(weight_name)

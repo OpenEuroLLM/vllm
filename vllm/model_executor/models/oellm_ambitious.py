@@ -25,8 +25,12 @@ CUDA graphs), no speculative decoding, no prefix caching.
 
 from __future__ import annotations
 
+import json
+import os
+import struct
 from collections.abc import Iterable
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -580,6 +584,25 @@ class OellmMoE(nn.Module):
 
 
 # ----------------------------------------------------------------------- Engram
+_ST_DTYPES = {"BF16": (np.uint16, torch.bfloat16), "F16": (np.uint16, torch.float16),
+              "F32": (np.float32, torch.float32)}
+
+
+def _safetensors_memmap(model_dir: str, name: str) -> torch.Tensor:
+    """A tensor of an exported checkpoint mapped from its safetensors shard (copy-on-write, so
+    no copy is made and the page cache is shared by every process on the node)."""
+    index = os.path.join(model_dir, "model.safetensors.index.json")
+    fname = json.load(open(index))["weight_map"][name] if os.path.exists(index) else "model.safetensors"
+    path = os.path.join(model_dir, fname)
+    with open(path, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        meta = json.loads(f.read(n))[name]
+    np_dtype, dtype = _ST_DTYPES[meta["dtype"]]
+    start, _ = meta["data_offsets"]
+    arr = np.memmap(path, dtype=np_dtype, mode="c", offset=8 + n + start, shape=tuple(meta["shape"]))
+    return torch.from_numpy(arr).view(dtype)
+
+
 class OellmEngram(MambaBase, nn.Module):
     """Megatron ``EngramLayer`` (the export's ``OellmEngramV2``). State per request:
     the depthwise conv window ``[h, (kernel - 1) * dilation]`` and the last
@@ -606,11 +629,23 @@ class OellmEngram(MambaBase, nn.Module):
         table_dtype = getattr(config, "engram_table_dtype", None) or "bf16"
         assert table_dtype in ("bf16", "fp32"), f"engram_table_dtype {table_dtype} not supported"
         self.dim = config.engram_embed_dim
-        self.table = VocabParallelEmbedding(
-            sum(self.sizes), self.dim,
-            params_dtype=torch.float32 if table_dtype == "fp32" else None,
-            prefix=f"{prefix}.table",
-        )
+        # OELLM_ENGRAM_TABLES: "mmap" (default: the export's shard mapped, rows read through the
+        # page cache, shared by the node's ranks), "ram" (the same, read once at load: resident),
+        # "gpu" (rows sharded over the TP ranks in GPU memory, an all-reduce per lookup)
+        self.table_mode = os.environ.get("OELLM_ENGRAM_TABLES", "mmap")
+        assert self.table_mode in ("mmap", "ram", "gpu"), self.table_mode
+        self.model_dir = vllm_config.model_config.model
+        self.host_table: torch.Tensor | None = None
+        if self.table_mode != "gpu":
+            from vllm.model_executor.model_loader.ep_weight_filter import skip_weight_name
+
+            skip_weight_name(f"{prefix}.table")  # mapped from the shard, never read by the loader
+        if self.table_mode == "gpu":
+            self.table = VocabParallelEmbedding(
+                sum(self.sizes), self.dim,
+                params_dtype=torch.float32 if table_dtype == "fp32" else None,
+                prefix=f"{prefix}.table",
+            )
         self.sign_hash = bool(getattr(config, "engram_sign_hash", False))
         if self.sign_hash:
             self.sign_mult = [[int(a) for a in r] for r in config.engram_sign_multipliers[str(layer_idx)]]
@@ -644,6 +679,25 @@ class OellmEngram(MambaBase, nn.Module):
 
     def get_state_shape(self):
         return ((self.h, self.pad), (self.hist,))
+
+    def _host(self) -> torch.Tensor:
+        if self.host_table is None:
+            t = _safetensors_memmap(self.model_dir, f"{self.prefix}.table")
+            assert t.shape == (sum(self.sizes), self.dim), (tuple(t.shape), self.prefix)
+            if self.table_mode == "ram":  # read through once: the page cache holds it
+                step = max(1, (1 << 28) // (self.dim * t.element_size()))
+                for a in range(0, t.shape[0], step):
+                    t[a : a + step].sum()
+            self.host_table = t
+        return self.host_table
+
+    def _lookup(self, rows: torch.Tensor) -> torch.Tensor:
+        """Table rows ``[..., L]`` -> ``[..., L, dim]``."""
+        if self.table_mode == "gpu":
+            return self.table(rows)
+        uniq, inv = torch.unique(rows.flatten().cpu(), return_inverse=True)
+        got = self._host()[uniq].to(rows.device, non_blocking=True)
+        return got[inv.to(rows.device)].view(*rows.shape, self.dim)
 
     def _rows(self, shifted: torch.Tensor, s: int, mult, sizes, offsets) -> torch.Tensor:
         p = self.hist
@@ -706,7 +760,7 @@ class OellmEngram(MambaBase, nn.Module):
             signs.append(sg)
             new_ids.append(nid)
         rows = torch.cat(rows)
-        e = self.table(rows).to(x.dtype)
+        e = self._lookup(rows).to(x.dtype)
         if self.sign_hash:
             e = e * self.sign_table[torch.cat(signs)].to(e.dtype)
         e = e.reshape(n, -1)
@@ -886,6 +940,10 @@ class OellmAmbitiousForCausalLM(nn.Module, HasInnerState, IsHybrid):
         loaded: set[str] = set()
         for name, w in weights:
             target, shard = self._map(name)
+            if shard == "host_table":
+                if target not in params:  # OELLM_ENGRAM_TABLES mmap / ram: mapped from the shard
+                    continue
+                shard = None
             if target in params:
                 p = params[target]
                 loader = getattr(p, "weight_loader", default_weight_loader)
@@ -924,6 +982,6 @@ class OellmAmbitiousForCausalLM(nn.Module, HasInnerState, IsHybrid):
                     "o_norm.weight": "o_norm_weight",
                 }.get(tail, tail)
             elif kind == "engram" and tail == "table":
-                return pre + "table.weight", None
+                return pre + "table.weight", "host_table"
             return pre + tail, None
         return name, None
