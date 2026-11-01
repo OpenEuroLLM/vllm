@@ -537,6 +537,16 @@ class OellmMoE(nn.Module):
         if self.impl == "fused":
             from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 
+            # the bound is an RMS over each expert's whole intermediate row: under plain TP
+            # FusedMoE splits that row over the ranks (each would bound its slice), under EP
+            # every rank holds whole experts
+            pc = get_current_vllm_config().parallel_config
+            if self.expert_norm is not None and self.tp > 1 and not pc.enable_expert_parallel:
+                raise ValueError(
+                    "the post-activation bound needs whole experts per rank: run with "
+                    "--enable-expert-parallel (or OELLM_MOE=naive) under tensor parallelism"
+                )
+
             self.experts = FusedMoEFactory(
                 num_experts=e, top_k=self.top_k, hidden_size=h, intermediate_size=i,
                 renormalize=True, custom_routing_function=self._route, scoring_func="sigmoid",
