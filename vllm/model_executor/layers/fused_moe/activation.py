@@ -199,10 +199,29 @@ class ApplyMoEActivationConfig:
         )
 
 
-def apply_post_act_norm(output: torch.Tensor, norm: tuple[float, float, bool]) -> None:
-    """In place: the bounded RMS norm of each row (one routed token-expert pair)."""
+def swiglu_post_act_norm(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    clamp_limit: float | None,
+    norm: tuple[float, float, bool],
+) -> None:
+    """SwiGLU (with the optional clamp) and the post-activation bound / norm in fp32,
+    rounded once to ``output``'s dtype -- the reference numerics (Megatron's
+    ``normed_swiglu``); a bf16 activation before the bound is a second rounding."""
+    d = input.shape[-1] // 2
+    gate, up = input[..., :d], input[..., d:]
+    if clamp_limit is not None:
+        gate, up = gate.clamp(max=clamp_limit), up.clamp(min=-clamp_limit, max=clamp_limit)
+    apply_post_act_norm(output, norm, act=F.silu(gate.float()) * up.float())
+
+
+def apply_post_act_norm(
+    output: torch.Tensor, norm: tuple[float, float, bool], act: torch.Tensor | None = None
+) -> None:
+    """In place: the bounded RMS norm of each row (one routed token-expert pair) of
+    ``act`` (default: ``output``)."""
     eps, floor, smooth = norm
-    act = output.float()
+    act = output.float() if act is None else act
     ms = act.square().mean(-1, keepdim=True)
     if smooth:
         scale = torch.rsqrt(1.0 + ms / (floor * floor))
@@ -363,6 +382,9 @@ def apply_moe_activation(
     _validate_moe_activation_shapes(activation, output, input, expected_dim=2)
 
     # Activations with gated multiplication (gate × activation(up))
+    if activation == MoEActivation.SILU and config.post_act_norm is not None:
+        swiglu_post_act_norm(output, input, config.clamp_limit, config.post_act_norm)
+        return output
     if activation == MoEActivation.SILU:
         if config.clamp_limit is not None:
             silu_and_mul_with_clamp(

@@ -7,8 +7,8 @@ import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.fused_moe.activation import (
-    apply_post_act_norm,
     MoEActivation,
+    swiglu_post_act_norm,
     apply_moe_activation_supported,
 )
 from vllm.model_executor.layers.fused_moe.config import (
@@ -208,13 +208,16 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         **kwargs,
     ) -> None:
         activation_config = self.activation_config
+        if activation == MoEActivation.SILU and activation_config.post_act_norm is not None:
+            swiglu_post_act_norm(
+                output, input, activation_config.clamp_limit, activation_config.post_act_norm
+            )
+            return
         if (
             activation == MoEActivation.SILU
             and activation_config.clamp_limit is not None
         ):
             swiglu_limit_func(output, input, activation_config.clamp_limit)
-            if activation_config.post_act_norm is not None:
-                apply_post_act_norm(output, activation_config.post_act_norm)
             return
 
         # SWIGLUOAI_UNINTERLEAVE routes to torch.ops._C.silu_and_mul_with_clamp
