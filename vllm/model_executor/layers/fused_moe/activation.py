@@ -171,6 +171,7 @@ class ApplyMoEActivationConfig:
     beta: float = 0.0
     activation_situ_beta: float | None = None
     activation_situ_linear_beta: float | None = None
+    post_act_norm: tuple[float, float, bool] | None = None
 
     @classmethod
     def from_configs(
@@ -194,7 +195,20 @@ class ApplyMoEActivationConfig:
             beta=0.0 if beta is None else beta,
             activation_situ_beta=moe_config.activation_situ_beta,
             activation_situ_linear_beta=moe_config.activation_situ_linear_beta,
+            post_act_norm=moe_config.post_act_norm,
         )
+
+
+def apply_post_act_norm(output: torch.Tensor, norm: tuple[float, float, bool]) -> None:
+    """In place: the bounded RMS norm of each row (one routed token-expert pair)."""
+    eps, floor, smooth = norm
+    act = output.float()
+    ms = act.square().mean(-1, keepdim=True)
+    if smooth:
+        scale = torch.rsqrt(1.0 + ms / (floor * floor))
+    else:
+        scale = torch.rsqrt((ms + eps).clamp(min=floor * floor))
+    output.copy_(act * scale)
 
 
 _DEFAULT_APPLY_MOE_ACTIVATION_CONFIG = ApplyMoEActivationConfig()
@@ -336,6 +350,8 @@ def apply_moe_activation(
     )
 
     if valid_token_counts is not None:
+        if config.post_act_norm is not None:
+            raise NotImplementedError("post_act_norm in the masked MoE activation")
         return _apply_moe_activation_masked(
             activation,
             output,
@@ -405,6 +421,8 @@ def apply_moe_activation(
     else:
         raise ValueError(f"Unsupported FusedMoe activation: {activation}")
 
+    if config.post_act_norm is not None:
+        apply_post_act_norm(output, config.post_act_norm)
     return output
 
 

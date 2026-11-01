@@ -1316,6 +1316,13 @@ class FusedMoEConfig:
     swiglu_alpha: float | None = None
     swiglu_beta: float | None = None
 
+    # Post-activation bound / norm of each routed (token, expert) activation (pab:
+    # floor 1, identity below rms 1), ``(eps, floor, smooth)``: act / max(rms(act), floor)
+    # (floor 0: the full norm act / rms(act)),
+    # smooth: act / sqrt(1 + ms / floor^2). Only kernels that run
+    # `apply_moe_activation` support it (`_supports_post_act_norm`).
+    post_act_norm: tuple[float, float, bool] | None = None
+
     # SituGLU parameters used by Kimi sit(u/v2) activations.
     activation_situ_beta: float | None = None
     activation_situ_linear_beta: float | None = None

@@ -66,6 +66,10 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
     """Triton-based fused MoE expert implementation."""
 
     @staticmethod
+    def _supports_post_act_norm() -> bool:
+        return True
+
+    @staticmethod
     def is_supported_config(
         cls: type[mk.FusedMoEExperts],
         moe_config: FusedMoEConfig,

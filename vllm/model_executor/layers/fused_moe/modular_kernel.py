@@ -590,7 +590,15 @@ class FusedMoEExperts(ABC):
             return False, _make_reason("batch invariance")
         elif moe_config.is_lora_enabled and not cls.supports_lora():
             return False, _make_reason("LoRA")
+        elif moe_config.post_act_norm is not None and not cls._supports_post_act_norm():
+            return False, _make_reason("the post-activation norm")
         return True, None
+
+    @staticmethod
+    def _supports_post_act_norm() -> bool:
+        """Whether the kernel applies `FusedMoEConfig.post_act_norm` (it runs
+        `apply_moe_activation` between its two GEMMs)."""
+        return False
 
     @staticmethod
     @abstractmethod

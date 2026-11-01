@@ -511,17 +511,18 @@ def _swiglu(gate, up, limit, norm=None):
 
 
 class OellmMoE(nn.Module):
-    """Experts sharded contiguously over the TP ranks (each rank computes its
-    experts' contributions, then one all-reduce); router and shared expert
-    replicated."""
+    """Sigmoid router (fp32 logits) with expert-bias (top-k on scores + bias) or quantile
+    balancing (top-k on logits - qb_beta) selection; weights = the unbiased scores
+    renormalised, times the scaling factor. Routed experts on vLLM's FusedMoE (TP / EP, fused
+    kernels) with the SwiGLU clamp (``swiglu_limit``) and the post-activation bound
+    (``post_act_norm``); ``OELLM_MOE=naive`` keeps a per-expert loop over TP-sharded experts.
+    The ungated shared expert is replicated."""
 
     def __init__(self, config, prefix: str) -> None:
         super().__init__()
         self.tp, self.tp_rank = _tp()
         h, e, i = config.hidden_size, config.num_experts, config.moe_intermediate_size
-        assert e % self.tp == 0, f"{e} experts do not divide over {self.tp} ranks"
-        self.num_experts, self.local = e, e // self.tp
-        self.first = self.tp_rank * self.local
+        self.num_experts, self.inter = e, i
         self.top_k, self.scaling = config.num_experts_per_tok, config.router_scaling_factor
         self.limit = config.activation_clamp_value
         pab = (config.rms_norm_eps, config.post_act_norm_floor, config.post_act_norm_smooth)
@@ -531,10 +532,25 @@ class OellmMoE(nn.Module):
         self.gate = nn.Parameter(torch.zeros(e, h))
         bias_name = "qb_beta" if self.quantile else "e_score_correction_bias"
         self.register_buffer(bias_name, torch.zeros(e, dtype=torch.float32))
-        self.gate_up_proj = nn.Parameter(torch.zeros(self.local, 2 * i, h))
-        self.down_proj = nn.Parameter(torch.zeros(self.local, h, i))
-        for p in (self.gate_up_proj, self.down_proj):
-            p.weight_loader = self._expert_loader
+        self.impl = os.environ.get("OELLM_MOE", "fused")
+        assert self.impl in ("fused", "naive"), self.impl
+        if self.impl == "fused":
+            from vllm.model_executor.layers.fused_moe import FusedMoEFactory
+
+            self.experts = FusedMoEFactory(
+                num_experts=e, top_k=self.top_k, hidden_size=h, intermediate_size=i,
+                renormalize=True, custom_routing_function=self._route, scoring_func="sigmoid",
+                activation="silu", swiglu_limit=self.limit, post_act_norm=self.expert_norm,
+                reduce_results=True, prefix=f"{prefix}.experts",
+            )
+        else:
+            assert e % self.tp == 0, f"{e} experts do not divide over {self.tp} ranks"
+            self.local = e // self.tp
+            self.first = self.tp_rank * self.local
+            self.gate_up_proj = nn.Parameter(torch.zeros(self.local, 2 * i, h))
+            self.down_proj = nn.Parameter(torch.zeros(self.local, h, i))
+            for p in (self.gate_up_proj, self.down_proj):
+                p.weight_loader = self._expert_loader
         si = config.shared_expert_intermediate_size
         self.shared = bool(si)
         if self.shared:
@@ -542,20 +558,54 @@ class OellmMoE(nn.Module):
             self.shared_up_proj = nn.Linear(h, si, bias=False)
             self.shared_down_proj = nn.Linear(si, h, bias=False)
 
+    # -- routing (both implementations)
+    def _route(self, hidden_states, gating_output, topk, renormalize):
+        logits = gating_output.float()
+        scores = torch.sigmoid(logits)
+        if self.quantile:
+            _, idx = torch.topk(logits - self.qb_beta.float(), topk, dim=-1)
+        else:
+            _, idx = torch.topk(scores + self.e_score_correction_bias.float(), topk, dim=-1)
+        w = scores.gather(-1, idx)
+        if topk > 1:
+            w = w / (w.sum(-1, keepdim=True) + 1e-20)
+        return w * self.scaling, idx
+
+    # -- weights: the export stacks [E, 2I, h] (gate | up) and [E, h, I]
+    def load_stacked(self, name: str, w: torch.Tensor) -> None:
+        if self.impl == "naive":
+            param = getattr(self, name)
+            param.data.copy_(w[self.first : self.first + self.local])
+            return
+        params = dict(self.experts.named_parameters())
+        if name == "gate_up_proj":
+            (pname, param), = [(n, p) for n, p in params.items() if n.endswith("w13_weight")]
+            for ex in range(self.num_experts):
+                param.weight_loader(param, w[ex, : self.inter], pname, shard_id="w1", expert_id=ex)
+                param.weight_loader(param, w[ex, self.inter :], pname, shard_id="w3", expert_id=ex)
+        else:
+            (pname, param), = [(n, p) for n, p in params.items() if n.endswith("w2_weight")]
+            for ex in range(self.num_experts):
+                param.weight_loader(param, w[ex], pname, shard_id="w2", expert_id=ex)
+
     def _expert_loader(self, param: torch.Tensor, loaded: torch.Tensor) -> None:
         param.data.copy_(loaded[self.first : self.first + self.local])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         logits = F.linear(x.float(), self.gate.float())
-        scores = torch.sigmoid(logits)
-        if self.quantile:
-            _, idx = torch.topk(logits - self.qb_beta.float(), self.top_k, dim=-1)
+        if self.impl == "fused":
+            out = self.experts(hidden_states=x, router_logits=logits)
         else:
-            _, idx = torch.topk(scores + self.e_score_correction_bias.float(), self.top_k, dim=-1)
-        w = scores.gather(-1, idx)
-        if self.top_k > 1:
-            w = w / (w.sum(-1, keepdim=True) + 1e-20)
-        w = (w * self.scaling).to(x.dtype)
+            out = self._naive(x, logits)
+        if self.shared:
+            out = out + self.shared_down_proj(
+                _swiglu(self.shared_gate_proj(x), self.shared_up_proj(x), self.limit, self.shared_norm)
+            )
+        return out
+
+    def _naive(self, x: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+        w, idx = self._route(x, logits, self.top_k, True)
+        w = w.to(x.dtype)
         out = torch.zeros_like(x)
         local = idx - self.first
         mine = (local >= 0) & (local < self.local)
@@ -576,10 +626,6 @@ class OellmMoE(nn.Module):
                 out.index_add_(0, tk, (y * w[tk, sl, None]).to(out.dtype))
         if self.tp > 1:
             out = tensor_model_parallel_all_reduce(out)
-        if self.shared:
-            out = out + self.shared_down_proj(
-                _swiglu(self.shared_gate_proj(x), self.shared_up_proj(x), self.limit, self.shared_norm)
-            )
         return out
 
 
@@ -938,8 +984,14 @@ class OellmAmbitiousForCausalLM(nn.Module, HasInnerState, IsHybrid):
         params = dict(self.named_parameters())
         buffers = dict(self.named_buffers())
         loaded: set[str] = set()
+        modules = dict(self.named_modules())
         for name, w in weights:
             target, shard = self._map(name)
+            if shard == "moe_stacked":
+                mod, pname = target.rsplit(".", 1)
+                modules[mod].load_stacked(pname, w)
+                loaded.update(n for n in params if n.startswith(mod + ".experts.") or n == target)
+                continue
             if shard == "host_table":
                 if target not in params:  # OELLM_ENGRAM_TABLES mmap / ram: mapped from the shard
                     continue
@@ -981,6 +1033,8 @@ class OellmAmbitiousForCausalLM(nn.Module, HasInnerState, IsHybrid):
                     "g_proj.1.bias": "g_proj1.bias",
                     "o_norm.weight": "o_norm_weight",
                 }.get(tail, tail)
+            elif kind == "moe" and tail in ("gate_up_proj", "down_proj"):
+                return pre + tail, "moe_stacked"
             elif kind == "engram" and tail == "table":
                 return pre + "table.weight", "host_table"
             return pre + tail, None

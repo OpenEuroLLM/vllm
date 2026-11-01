@@ -106,6 +106,7 @@ def FusedMoEFactory(
     scoring_func: str = "softmax",
     routed_scaling_factor: float = 1.0,
     swiglu_limit: float | None = None,
+    post_act_norm: tuple[float, float, bool] | None = None,
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
     activation_situ_beta: float | None = None,
@@ -368,6 +369,7 @@ def FusedMoEFactory(
         routing_method=router.routing_method_type,  # Not ideal
         has_hash_routing=hash_indices_table is not None,
         swiglu_limit=swiglu_limit,
+        post_act_norm=post_act_norm,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         activation_situ_beta=activation_situ_beta,
