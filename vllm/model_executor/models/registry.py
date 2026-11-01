@@ -181,6 +181,7 @@ _TEXT_GENERATION_MODELS = {
     "NemotronHPuzzleForCausalLM": ("nemotron_h", "NemotronHForCausalLM"),
     "MuseGlimmerForCausalLM": ("muse_glimmer", "MuseGlimmerForCausalLM"),
     "OlmoHybridForCausalLM": ("olmo_hybrid", "OlmoHybridForCausalLM"),
+    "OellmAmbitiousForCausalLM": ("oellm_ambitious", "OellmAmbitiousForCausalLM"),
     "OlmoeForCausalLM": ("olmoe", "OlmoeForCausalLM"),
     "OPTForCausalLM": ("opt", "OPTForCausalLM"),
     "OrionForCausalLM": ("orion", "OrionForCausalLM"),
