@@ -811,10 +811,32 @@ class OellmAmbitiousModel(nn.Module):
         return self.norm(h)
 
 
+# Fields later exports added, with the defaults of the export's config class: an older export's
+# bundled configuration file does not define them.
+_CONFIG_DEFAULTS = {
+    "residual": "mhc",
+    "ldm_groups": 16,
+    "ldm_key_dim": 8,
+    "ldm_hidden_dim": 32,
+    "ldm_alpha": 1.0,
+    "layernorm_zero_centered_gamma": False,
+    "router_balancing": "expert_bias",
+    "moe_expert_post_act_norm": False,
+    "mlp_post_act_norm": False,
+    "post_act_norm_floor": 0.0,
+    "post_act_norm_smooth": False,
+    "engram_sign_hash": False,
+    "engram_table_dtype": "bf16",
+}
+
+
 class OellmAmbitiousForCausalLM(nn.Module, HasInnerState, IsHybrid):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
+        for key, value in _CONFIG_DEFAULTS.items():
+            if getattr(config, key, None) is None:
+                setattr(config, key, value)
         self.config = config
         self.vllm_config = vllm_config
         self.model = OellmAmbitiousModel(vllm_config=vllm_config, prefix="model")
