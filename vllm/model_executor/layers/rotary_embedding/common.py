@@ -125,7 +125,9 @@ class ApplyRotaryEmb(CustomOp):
 
         self.apply_rotary_emb_flash_attn = None
         if not current_platform.is_cpu():
-            with suppress(ModuleNotFoundError):
+            # ImportError too: a flash_attn built against another torch (e.g. a
+            # container's, under a vLLM installed beside it) fails to load its .so
+            with suppress(ImportError):
                 self.apply_rotary_emb_flash_attn = import_module(
                     "flash_attn.ops.triton.rotary"
                 ).apply_rotary
