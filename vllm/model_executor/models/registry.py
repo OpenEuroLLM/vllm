@@ -182,6 +182,7 @@ _TEXT_GENERATION_MODELS = {
     "MuseGlimmerForCausalLM": ("muse_glimmer", "MuseGlimmerForCausalLM"),
     "OlmoHybridForCausalLM": ("olmo_hybrid", "OlmoHybridForCausalLM"),
     "OellmAmbitiousForCausalLM": ("oellm_ambitious", "OellmAmbitiousForCausalLM"),
+    "OellmQ35ForCausalLM": ("qwen3_next", "OellmQ35ForCausalLM"),
     "OlmoeForCausalLM": ("olmoe", "OlmoeForCausalLM"),
     "OPTForCausalLM": ("opt", "OPTForCausalLM"),
     "OrionForCausalLM": ("orion", "OrionForCausalLM"),

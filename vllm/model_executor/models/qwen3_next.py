@@ -188,11 +188,23 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
         self.n_local_physical_experts = self.n_physical_experts // self.ep_size
 
+        # router_score_function "sigmoid" (OpenEuroLLM's conservative run, oellm_q35):
+        # Megatron's router -- fp32 weight and logits, top-k on sigmoid scores + an expert
+        # bias, the unbiased scores renormalised, times router_scaling_factor
+        self.sigmoid_router = (
+            getattr(config, "router_score_function", "softmax") == "sigmoid"
+        )
         self.gate = GateLinear(
             config.hidden_size,
             config.num_experts,
+            params_dtype=torch.float32 if self.sigmoid_router else None,
+            out_dtype=torch.float32 if self.sigmoid_router else None,
             prefix=f"{prefix}.gate",
         )
+        if self.sigmoid_router:
+            self.gate.e_score_correction_bias = nn.Parameter(
+                torch.zeros(config.num_experts, dtype=torch.float32), requires_grad=False
+            )
 
         self.shared_expert_gate = ReplicatedLinear(
             config.hidden_size,
@@ -230,6 +242,15 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             renormalize=getattr(config, "norm_topk_prob", True),
+            **(
+                dict(
+                    scoring_func="sigmoid",
+                    e_score_correction_bias=self.gate.e_score_correction_bias,
+                    routed_scaling_factor=getattr(config, "router_scaling_factor", 1.0),
+                )
+                if self.sigmoid_router
+                else {}
+            ),
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
             enable_eplb=self.enable_eplb,
@@ -924,3 +945,8 @@ class Qwen3NextForCausalLM(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+
+class OellmQ35ForCausalLM(Qwen3NextForCausalLM):
+    """OpenEuroLLM's conservative run (HF export ``oellm_q35``): Qwen3-Next with Megatron's
+    sigmoid + expert-bias router (``router_score_function`` "sigmoid")."""
