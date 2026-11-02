@@ -908,6 +908,19 @@ class OellmAmbitiousLayer(nn.Module):
         return self.mhc.write(streams, self._sublayer(x, input_ids), pending)
 
 
+class OellmEmbedNorm(nn.Module):
+    """Megatron's embedding_norm: an fp32 RMSNorm of the embedding output with a learnable gain
+    (the export's model.embed_norm.weight)."""
+
+    def __init__(self, hidden: int, eps: float) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.rms_norm(x.float(), (x.shape[-1],), self.weight.float(), self.eps).to(x.dtype)
+
+
 class OellmAmbitiousModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -920,7 +933,7 @@ class OellmAmbitiousModel(nn.Module):
         # RMSNorm with a learnable gain (Megatron LanguageModelEmbedding)
         self.embed_scale = float(config.embedding_multiplier)
         self.embed_norm = (
-            nn.Parameter(torch.ones(config.hidden_size)) if config.embedding_norm else None
+            OellmEmbedNorm(config.hidden_size, config.rms_norm_eps) if config.embedding_norm else None
         )
         self.ldm = config.residual == "ldm"
         self.ldm_boundary = OellmLDMBoundary(config) if self.ldm else None
@@ -945,9 +958,7 @@ class OellmAmbitiousModel(nn.Module):
         if self.embed_scale != 1.0:
             x = x * self.embed_scale
         if self.embed_norm is not None:
-            x = F.rms_norm(
-                x.float(), (x.shape[-1],), self.embed_norm.float(), self.config.rms_norm_eps
-            ).to(x.dtype)
+            x = self.embed_norm(x)
         if self.ldm:
             streams = self.ldm_boundary.enter(x)
         else:
