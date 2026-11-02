@@ -510,6 +510,19 @@ def _swiglu(gate, up, limit, norm=None):
     return (act * scale).to(gate.dtype)
 
 
+class _Fp8Experts:
+    """Stacked fp8 expert weights [E, rows, cols] (uint8 E4M3 bytes + fp32 scales [E, rows, cols /
+    block]), indexed like the bf16 stack: [e] / [e, a:b] dequantize that slice to bf16."""
+
+    def __init__(self, q: torch.Tensor, scale: torch.Tensor, block: int) -> None:
+        self.q, self.scale, self.block = q, scale, block
+
+    def __getitem__(self, idx) -> torch.Tensor:
+        q = self.q[idx].view(torch.float8_e4m3fn).float()
+        s = self.scale[idx].float()
+        return (q.view(*q.shape[:-1], -1, self.block) * s[..., None]).view(q.shape).to(torch.bfloat16)
+
+
 class OellmMoE(nn.Module):
     """Sigmoid router (fp32 logits) with expert-bias (top-k on scores + bias) or quantile
     balancing (top-k on logits - qb_beta) selection; weights = the unbiased scores
@@ -532,6 +545,8 @@ class OellmMoE(nn.Module):
         self.gate = nn.Parameter(torch.zeros(e, h))
         bias_name = "qb_beta" if self.quantile else "e_score_correction_bias"
         self.register_buffer(bias_name, torch.zeros(e, dtype=torch.float32))
+        self.fp8 = config.expert_weight_dtype == "fp8"
+        self.block = int(config.expert_scale_block)
         self.impl = os.environ.get("OELLM_MOE", "fused")
         assert self.impl in ("fused", "naive"), self.impl
         if self.impl == "fused":
@@ -581,8 +596,19 @@ class OellmMoE(nn.Module):
             w = w / (w.sum(-1, keepdim=True) + 1e-20)
         return w * self.scaling, idx
 
-    # -- weights: the export stacks [E, 2I, h] (gate | up) and [E, h, I]
+    # -- weights: the export stacks [E, 2I, h] (gate | up) and [E, h, I]; with expert_weight_dtype
+    # fp8 as E4M3 bytes (uint8) + fp32 scales per 128 elements of a row (<name>_scale), dequantized
+    # here as Megatron's fsdp_fp8_param_gather does (E4M3 -> fp32, times the scale, one bf16
+    # rounding): the experts hold exactly the weights the run's forward used
     def load_stacked(self, name: str, w: torch.Tensor) -> None:
+        if self.fp8:
+            pending = self.__dict__.setdefault("_fp8_pending", {})
+            pending[name] = w
+            base = name.removesuffix("_scale")
+            if base not in pending or base + "_scale" not in pending:
+                return
+            q, sc = pending.pop(base), pending.pop(base + "_scale")
+            name, w = base, _Fp8Experts(q, sc, self.block)
         if self.impl == "naive":
             param = getattr(self, name)
             param.data.copy_(w[self.first : self.first + self.local])
@@ -890,6 +916,12 @@ class OellmAmbitiousModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size, prefix=f"{prefix}.embed_tokens"
         )
+        # the export's embedding output: x * embedding_multiplier, then (embedding_norm) an fp32
+        # RMSNorm with a learnable gain (Megatron LanguageModelEmbedding)
+        self.embed_scale = float(config.embedding_multiplier)
+        self.embed_norm = (
+            nn.Parameter(torch.ones(config.hidden_size)) if config.embedding_norm else None
+        )
         self.ldm = config.residual == "ldm"
         self.ldm_boundary = OellmLDMBoundary(config) if self.ldm else None
         self.layers = nn.ModuleList(
@@ -910,6 +942,12 @@ class OellmAmbitiousModel(nn.Module):
         assert get_pp_group().world_size == 1, "pipeline parallelism is not supported"
         assert input_ids is not None, "the Engram layers need input_ids"
         x = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
+        if self.embed_scale != 1.0:
+            x = x * self.embed_scale
+        if self.embed_norm is not None:
+            x = F.rms_norm(
+                x.float(), (x.shape[-1],), self.embed_norm.float(), self.config.rms_norm_eps
+            ).to(x.dtype)
         if self.ldm:
             streams = self.ldm_boundary.enter(x)
         else:
@@ -937,6 +975,10 @@ _CONFIG_DEFAULTS = {
     "post_act_norm_smooth": False,
     "engram_sign_hash": False,
     "engram_table_dtype": "bf16",
+    "embedding_multiplier": 1.0,
+    "embedding_norm": False,
+    "expert_weight_dtype": "bf16",
+    "expert_scale_block": 128,
 }
 
 
@@ -1043,7 +1085,9 @@ class OellmAmbitiousForCausalLM(nn.Module, HasInnerState, IsHybrid):
                     "g_proj.1.bias": "g_proj1.bias",
                     "o_norm.weight": "o_norm_weight",
                 }.get(tail, tail)
-            elif kind == "moe" and tail in ("gate_up_proj", "down_proj"):
+            elif kind == "moe" and tail in (
+                "gate_up_proj", "down_proj", "gate_up_proj_scale", "down_proj_scale"
+            ):
                 return pre + tail, "moe_stacked"
             elif kind == "engram" and tail == "table":
                 return pre + "table.weight", "host_table"
