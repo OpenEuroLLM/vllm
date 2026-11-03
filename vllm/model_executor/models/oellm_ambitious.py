@@ -19,17 +19,20 @@ the residual read / write of mHC (``residual="mhc"``) or the Linear Depth Memory
   dilated causal conv; the last ``max(orders) - 1`` token ids and the conv window
   live in the mamba cache (short-conv metadata).
 
-mHC and LDM are per token (no state across tokens). Eager only (no torch.compile /
-CUDA graphs), no speculative decoding, no prefix caching.
+mHC and LDM are per token (no state across tokens). Optional local decode CUDA
+graph islands exclude host lookups and collectives. No speculative decoding or
+prefix caching.
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import mmap
 import os
 import struct
 from collections.abc import Callable, Iterable
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -66,6 +69,7 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from vllm.model_executor.layers.oellm_graph import DecodeGraph
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -113,8 +117,13 @@ class OellmRMSNorm(nn.Module):
             torch.zeros(size) if zero_centered else torch.ones(size)
         )
         self.eps, self.zero_centered = eps, zero_centered
+        self.fused = os.environ.get("OELLM_FUSION_IMPL", "reference") == "triton"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.fused and x.is_cuda and not torch.is_grad_enabled():
+            from vllm.model_executor.layers.oellm_fusion import rms_norm
+
+            return rms_norm(x, self.weight, self.eps, self.zero_centered)
         xf = x.float()
         xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)
         w = self.weight.float() + (1.0 if self.zero_centered else 0.0)
@@ -144,6 +153,7 @@ class OellmMHC(nn.Module):
         super().__init__()
         n, h = config.mhc_expansion_rate, config.hidden_size
         self.n, self.iters, self.eps = n, config.mhc_sinkhorn_iters, config.mhc_eps
+        self.fused = os.environ.get("OELLM_FUSION_IMPL", "reference") == "triton"
         self.phi = nn.Parameter(torch.zeros(n * h, 2 * n + n * n))
         self.b_pre = nn.Parameter(torch.zeros(n))
         self.b_post = nn.Parameter(torch.zeros(n))
@@ -153,6 +163,26 @@ class OellmMHC(nn.Module):
         self.alpha_res = nn.Parameter(torch.zeros(1))
 
     def read(self, streams: torch.Tensor):
+        if (
+            self.fused
+            and self.n == 4
+            and streams.is_cuda
+            and not torch.is_grad_enabled()
+        ):
+            from vllm.model_executor.layers.oellm_fusion import mhc_read
+
+            return mhc_read(
+                streams,
+                self.phi,
+                self.alpha_pre,
+                self.alpha_post,
+                self.alpha_res,
+                self.b_pre,
+                self.b_post,
+                self.b_res,
+                self.eps,
+                self.iters,
+            )
         t, n, h = streams.shape
         flat = streams.reshape(t, n * h)
         r = (
@@ -173,8 +203,16 @@ class OellmMHC(nn.Module):
         x = (h_pre.to(streams.dtype).unsqueeze(-1) * streams).sum(dim=-2)
         return x, (h_post, h_res)
 
-    @staticmethod
-    def write(streams: torch.Tensor, out: torch.Tensor, pending) -> torch.Tensor:
+    def write(self, streams: torch.Tensor, out: torch.Tensor, pending) -> torch.Tensor:
+        if (
+            self.fused
+            and self.n == 4
+            and streams.is_cuda
+            and not torch.is_grad_enabled()
+        ):
+            from vllm.model_executor.layers.oellm_fusion import mhc_write
+
+            return mhc_write(streams, out, pending)
         h_post, h_res = (p.to(streams.dtype) for p in pending)
         mixed = (h_res.unsqueeze(-1) * streams.unsqueeze(-3)).sum(dim=-2)
         return mixed + h_post.unsqueeze(-1) * out.unsqueeze(-2)
@@ -646,6 +684,8 @@ class OellmMoE(nn.Module):
         self.tp, self.tp_rank = _tp()
         h, e, i = config.hidden_size, config.num_experts, config.moe_intermediate_size
         self.num_experts, self.inter = e, i
+        self.route_graph = DecodeGraph()
+        self.shared_graph = DecodeGraph()
         self.top_k, self.scaling = (
             config.num_experts_per_tok,
             config.router_scaling_factor,
@@ -730,6 +770,13 @@ class OellmMoE(nn.Module):
 
     # -- routing (both implementations)
     def _route(self, hidden_states, gating_output, topk, renormalize):
+        if get_forward_context().additional_kwargs.get("oellm_decode_graph", False):
+            return self.route_graph(
+                lambda logits: self._route_impl(logits, topk), gating_output, key=topk
+            )
+        return self._route_impl(gating_output, topk)
+
+    def _route_impl(self, gating_output, topk):
         logits = gating_output.float()
         scores = torch.sigmoid(logits)
         if self.quantile:
@@ -797,15 +844,22 @@ class OellmMoE(nn.Module):
         else:
             out = self._naive(x, logits)
         if self.shared:
-            out = out + self.shared_down_proj(
-                _swiglu(
-                    self.shared_gate_proj(x),
-                    self.shared_up_proj(x),
-                    self.limit,
-                    self.shared_norm,
-                )
-            )
+            if get_forward_context().additional_kwargs.get("oellm_decode_graph", False):
+                shared = self.shared_graph(self._shared_forward, x)
+            else:
+                shared = self._shared_forward(x)
+            out = out + shared
         return out
+
+    def _shared_forward(self, x):
+        return self.shared_down_proj(
+            _swiglu(
+                self.shared_gate_proj(x),
+                self.shared_up_proj(x),
+                self.limit,
+                self.shared_norm,
+            )
+        )
 
     def _naive(self, x: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
         w, idx = self._route(x, logits, self.top_k, True)
@@ -1167,6 +1221,9 @@ class OellmAmbitiousLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.kind = config.block_types[layer_idx]
+        self.pre_graph = DecodeGraph()
+        self.post_graph = DecodeGraph()
+        self.ckda_graph = DecodeGraph()
         self.ldm = config.residual == "ldm"
         if self.ldm:
             self.ldm_mixer = OellmLDMMixer(config)
@@ -1205,6 +1262,48 @@ class OellmAmbitiousLayer(nn.Module):
                 covariance,
             )
             return x, r, memory, covariance
+        graph = get_forward_context().additional_kwargs.get("oellm_decode_graph", False)
+        if graph and self.kind == "ckda" and _tp()[0] == 1:
+            meta = _layer_metadata(self.mixer.prefix)
+            if meta is None:
+                return self.ckda_graph(
+                    lambda value: self._mhc_forward(value, input_ids),
+                    streams,
+                    key="dummy",
+                )
+            if meta.num_prefills == 0 and meta.spec_sequence_masks is None:
+                idx = meta.non_spec_state_indices_tensor
+
+                def call(value, slots):
+                    raw = cast(dict[str, Any], get_forward_context().attn_metadata)
+                    previous = raw[self.mixer.prefix]
+                    staged = copy.copy(meta)
+                    staged.non_spec_state_indices_tensor = slots
+                    raw[self.mixer.prefix] = staged
+                    try:
+                        return self._mhc_forward(value, input_ids)
+                    finally:
+                        raw[self.mixer.prefix] = previous
+
+                key = (
+                    meta.num_actual_tokens,
+                    tuple(t.data_ptr() for t in self.mixer.kv_cache),
+                )
+                return self.ckda_graph(call, streams, idx, key=key)
+        if graph and self.kind not in ("ckda", "engram"):
+            x, post, res = self.pre_graph(self._mhc_pre, streams)
+            out = self.mixer(x)
+            return self.post_graph(self._mhc_post, streams, out, post, res)
+        return self._mhc_forward(streams, input_ids)
+
+    def _mhc_pre(self, streams):
+        x, (post, res) = self.mhc.read(streams)
+        return self.input_layernorm(x), post, res
+
+    def _mhc_post(self, streams, out, post, res):
+        return self.mhc.write(streams, out, (post, res))
+
+    def _mhc_forward(self, streams, input_ids):
         x, pending = self.mhc.read(streams)
         return self.mhc.write(streams, self._sublayer(x, input_ids), pending)
 
@@ -1276,6 +1375,24 @@ class OellmAmbitiousModel(nn.Module):
         else:
             n = self.config.mhc_expansion_rate
             streams = x.unsqueeze(-2).expand(x.shape[0], n, x.shape[-1]).contiguous()
+        ctx = get_forward_context()
+        meta = next(
+            (
+                _layer_metadata(layer.mixer.prefix)
+                for layer in self.layers
+                if layer.kind == "engram"
+            ),
+            None,
+        )
+        ctx.additional_kwargs["oellm_decode_graph"] = (
+            os.environ.get("OELLM_DECODE_GRAPHS", "0") == "1"
+            and not torch.is_grad_enabled()
+            and x.is_cuda
+            and x.shape[0] <= int(os.environ.get("OELLM_GRAPH_MAX_ROWS", "256"))
+            and (
+                meta is None or (meta.num_prefills == 0 and meta.num_decode_tokens > 0)
+            )
+        )
         for layer in self.layers:
             streams = layer(streams, input_ids)
         h = streams[0] + streams[1] if self.ldm else streams.mean(dim=-2)
