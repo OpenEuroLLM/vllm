@@ -917,6 +917,12 @@ class OellmEngram(MambaBase, nn.Module):
         self.lookup_mode = os.environ.get("OELLM_ENGRAM_LOOKUP", "replicated")
         if self.lookup_mode not in ("replicated", "leader"):
             raise ValueError(f"Unknown OELLM_ENGRAM_LOOKUP: {self.lookup_mode}")
+        decode_impl = os.environ.get("OELLM_ENGRAM_DECODE_IMPL", "reference")
+        if decode_impl not in ("reference", "batched"):
+            raise ValueError(f"Unknown OELLM_ENGRAM_DECODE_IMPL: {decode_impl}")
+        self.batched_decode = decode_impl == "batched"
+        if self.batched_decode and vllm_config.speculative_config is not None:
+            raise ValueError("Batched Engram decode requires speculative decoding off")
         self.host_table: torch.Tensor | None = None
         if self.table_mode != "gpu":
             from vllm.model_executor.model_loader.ep_weight_filter import (
@@ -1036,6 +1042,18 @@ class OellmEngram(MambaBase, nn.Module):
             )
         return rows, signs, shifted[shifted.shape[0] - self.hist :]
 
+    def _rows_decode(self, shifted: torch.Tensor, mult, sizes, offsets) -> torch.Tensor:
+        history = [shifted[:, self.hist - i] for i in range(max(self.orders))]
+        out, lookup = [], 0
+        for n in self.orders:
+            for _ in range(self.num_heads):
+                hsh = torch.zeros_like(history[0])
+                for i in range(n):
+                    hsh = hsh ^ (history[i] * mult[lookup][i])
+                out.append(torch.remainder(hsh, sizes[lookup]) + offsets[lookup])
+                lookup += 1
+        return torch.stack(out, dim=-1)
+
     def _conv(self, v: torch.Tensor, state: torch.Tensor):
         """V [s, h], state [h, pad] -> (conv [s, h], new state)."""
         padded = torch.cat([state.to(v.dtype), v.transpose(0, 1)], dim=-1)
@@ -1047,10 +1065,19 @@ class OellmEngram(MambaBase, nn.Module):
         )
         return conv[0].transpose(0, 1), padded[:, padded.shape[-1] - self.pad :]
 
+    def _conv_decode(self, v: torch.Tensor, state: torch.Tensor):
+        padded = torch.cat([state.to(v.dtype), v.unsqueeze(-1)], dim=-1)
+        conv = F.conv1d(
+            padded, self.conv1d.weight, groups=self.h, dilation=self.dilation
+        )
+        return conv[:, :, 0], padded[:, :, padded.shape[-1] - self.pad :]
+
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         t = x.shape[0]
         m = _layer_metadata(self.prefix)
         ids = self.token_map[input_ids] if self.use_token_map else input_ids
+        decode_slots = None
+        nd = 0
         if m is None:  # profile run: one request without history
             spans = [(0, t, None, False)]
             conv_state = id_state = None
@@ -1060,16 +1087,37 @@ class OellmEngram(MambaBase, nn.Module):
             nd = m.num_decode_tokens
             if nd:
                 sd = m.state_indices_tensor_d.flatten()
-                for j in range(nd):
-                    spans.append((j, j + 1, sd[j], True))
+                if self.batched_decode:
+                    decode_slots = sd[:nd]
+                else:
+                    for j in range(nd):
+                        spans.append((j, j + 1, sd[j], True))
             if m.num_prefills:
                 qsl = (m.query_start_loc_p + nd).tolist()
                 init = m.has_initial_states_p.tolist()
                 sp = m.state_indices_tensor_p.flatten()
                 for j in range(m.num_prefills):
                     spans.append((qsl[j], qsl[j + 1], sp[j], bool(init[j])))
-        n = spans[-1][1]
+        n = spans[-1][1] if spans else nd
         rows, signs, new_ids = [], [], []
+        if decode_slots is not None:
+            assert id_state is not None
+            shifted = torch.cat(
+                [id_state[decode_slots], ids[:nd, None].long() + 1], dim=1
+            )
+            rows.append(
+                self._rows_decode(shifted, self.hash_mult, self.sizes, self.offsets)
+            )
+            if self.sign_hash:
+                signs.append(
+                    self._rows_decode(
+                        shifted,
+                        self.sign_mult,
+                        [self.sign_size] * len(self.sizes),
+                        [0] * len(self.sizes),
+                    )
+                )
+            decode_ids = shifted[:, -self.hist :]
         zero_ids = ids.new_zeros(self.hist, dtype=torch.long)
         for a, b, slot, has_init in spans:
             st = id_state[slot] if (slot is not None and has_init) else zero_ids
@@ -1092,6 +1140,12 @@ class OellmEngram(MambaBase, nn.Module):
         vv = torch.sigmoid(gate).to(vv.dtype) * vv
         conv_in = vv if self.conv_norm is None else self.conv_norm(vv)
         outs = []
+        if decode_slots is not None:
+            assert conv_state is not None and id_state is not None
+            c, nst = self._conv_decode(conv_in[:nd], conv_state[decode_slots])
+            outs.append(c)
+            conv_state[decode_slots] = nst.to(conv_state.dtype)
+            id_state[decode_slots] = decode_ids
         zero_conv = conv_in.new_zeros(self.h, self.pad)
         for (a, b, slot, has_init), nid in zip(spans, new_ids):
             st = conv_state[slot] if (slot is not None and has_init) else zero_conv
