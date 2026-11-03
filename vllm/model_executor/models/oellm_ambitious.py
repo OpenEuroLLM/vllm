@@ -48,7 +48,7 @@ from vllm.distributed import (
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -105,6 +105,13 @@ def _layer_metadata(prefix: str):
         return None
     assert isinstance(raw, dict)
     return raw.get(prefix)
+
+
+def _decode_graph_enabled():
+    return (
+        is_forward_context_available()
+        and get_forward_context().additional_kwargs.get("oellm_decode_graph", False)
+    )
 
 
 class OellmRMSNorm(nn.Module):
@@ -770,7 +777,7 @@ class OellmMoE(nn.Module):
 
     # -- routing (both implementations)
     def _route(self, hidden_states, gating_output, topk, renormalize):
-        if get_forward_context().additional_kwargs.get("oellm_decode_graph", False):
+        if _decode_graph_enabled():
             return self.route_graph(
                 lambda logits: self._route_impl(logits, topk), gating_output, key=topk
             )
@@ -844,7 +851,7 @@ class OellmMoE(nn.Module):
         else:
             out = self._naive(x, logits)
         if self.shared:
-            if get_forward_context().additional_kwargs.get("oellm_decode_graph", False):
+            if _decode_graph_enabled():
                 shared = self.shared_graph(self._shared_forward, x)
             else:
                 shared = self._shared_forward(x)
@@ -942,6 +949,7 @@ class OellmEngram(MambaBase, nn.Module):
         self.dilation = max(self.orders)
         self.pad = (self.kernel_size - 1) * self.dilation
         self.hist = max(self.orders) - 1
+        self.rows_graph = DecodeGraph(max_entries=16)
         self.offsets = [0]
         for n in self.sizes[:-1]:
             self.offsets.append(self.offsets[-1] + n)
@@ -1097,6 +1105,16 @@ class OellmEngram(MambaBase, nn.Module):
         return rows, signs, shifted[shifted.shape[0] - self.hist :]
 
     def _rows_decode(self, shifted: torch.Tensor, mult, sizes, offsets) -> torch.Tensor:
+        if _decode_graph_enabled():
+            key = (tuple(tuple(row) for row in mult), tuple(sizes), tuple(offsets))
+            return self.rows_graph(
+                lambda value: self._rows_decode_impl(value, mult, sizes, offsets),
+                shifted,
+                key=key,
+            )
+        return self._rows_decode_impl(shifted, mult, sizes, offsets)
+
+    def _rows_decode_impl(self, shifted, mult, sizes, offsets):
         history = [shifted[:, self.hist - i] for i in range(max(self.orders))]
         out, lookup = [], 0
         for n in self.orders:
@@ -1262,7 +1280,7 @@ class OellmAmbitiousLayer(nn.Module):
                 covariance,
             )
             return x, r, memory, covariance
-        graph = get_forward_context().additional_kwargs.get("oellm_decode_graph", False)
+        graph = _decode_graph_enabled()
         if graph and self.kind == "ckda" and _tp()[0] == 1:
             meta = _layer_metadata(self.mixer.prefix)
             if meta is None:
@@ -1388,6 +1406,8 @@ class OellmAmbitiousModel(nn.Module):
             os.environ.get("OELLM_DECODE_GRAPHS", "0") == "1"
             and not torch.is_grad_enabled()
             and x.is_cuda
+            and x.shape[0] > 0
+            and (x.shape[0] & (x.shape[0] - 1)) == 0
             and x.shape[0] <= int(os.environ.get("OELLM_GRAPH_MAX_ROWS", "256"))
             and (
                 meta is None or (meta.num_prefills == 0 and meta.num_decode_tokens > 0)

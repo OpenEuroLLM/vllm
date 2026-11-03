@@ -4,6 +4,8 @@
 
 import torch
 
+from vllm.platforms import current_platform
+
 
 class DecodeGraph:
     """Stage changing inputs and replay a shape-specific local CUDA graph.
@@ -11,9 +13,11 @@ class DecodeGraph:
     The initial eager call warms kernels and advances state once. Capture only
     records kernels: it is not replayed on that call, so recurrent state is not
     advanced a second time. Outputs remain valid until this island's next call.
+    Islands replay sequentially in model order; their private-pool scratch can
+    therefore be shared. Strong output references preserve cross-island values.
     """
 
-    def __init__(self, max_entries=4):
+    def __init__(self, max_entries=8):
         self.entries = {}
         self.max_entries = max_entries
         self.captures = 0
@@ -34,7 +38,12 @@ class DecodeGraph:
             stream = torch.cuda.Stream(device=args[0].device)
             stream.wait_stream(torch.cuda.current_stream())
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+            with (
+                torch.cuda.stream(stream),
+                torch.cuda.graph(
+                    graph, stream=stream, pool=current_platform.get_global_graph_pool()
+                ),
+            ):
                 output = fn(*static)
             torch.cuda.current_stream().wait_stream(stream)
             self.entries[signature] = (graph, static, output)
