@@ -26,9 +26,10 @@ CUDA graphs), no speculative decoding, no prefix caching.
 from __future__ import annotations
 
 import json
+import mmap
 import os
 import struct
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 import numpy as np
 import torch
@@ -37,9 +38,11 @@ from torch import nn
 
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
+    get_ep_group,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context
@@ -68,7 +71,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 from .interfaces import HasInnerState, IsHybrid
@@ -107,7 +109,9 @@ class OellmRMSNorm(nn.Module):
 
     def __init__(self, size: int, eps: float, zero_centered: bool = False) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.zeros(size) if zero_centered else torch.ones(size))
+        self.weight = nn.Parameter(
+            torch.zeros(size) if zero_centered else torch.ones(size)
+        )
         self.eps, self.zero_centered = eps, zero_centered
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -119,6 +123,15 @@ class OellmRMSNorm(nn.Module):
 
 # ----------------------------------------------------------------------- residuals
 def _sinkhorn(logits: torch.Tensor, iters: int) -> torch.Tensor:
+    if (
+        os.environ.get("OELLM_MHC_IMPL", "reference") == "triton"
+        and logits.is_cuda
+        and logits.shape[-2:] == (4, 4)
+        and not logits.requires_grad
+    ):
+        from vllm.model_executor.layers.oellm_mhc import sinkhorn4
+
+        return sinkhorn4(logits, iters)
     x = logits.float()
     for _ in range(iters):
         x = x - torch.logsumexp(x, dim=-2, keepdim=True)
@@ -142,11 +155,18 @@ class OellmMHC(nn.Module):
     def read(self, streams: torch.Tensor):
         t, n, h = streams.shape
         flat = streams.reshape(t, n * h)
-        r = torch.linalg.vector_norm(flat, dim=-1, keepdim=True).float() / (n * h) ** 0.5
-        coeffs = torch.matmul(flat, self.phi.to(flat.dtype)).float() / r.clamp(min=self.eps)
+        r = (
+            torch.linalg.vector_norm(flat, dim=-1, keepdim=True).float()
+            / (n * h) ** 0.5
+        )
+        coeffs = torch.matmul(flat, self.phi.to(flat.dtype)).float() / r.clamp(
+            min=self.eps
+        )
         pre, post, res = torch.split(coeffs, [n, n, n * n], dim=-1)
         h_pre = torch.sigmoid(self.alpha_pre.float() * pre + self.b_pre.float())
-        h_post = 2.0 * torch.sigmoid(self.alpha_post.float() * post + self.b_post.float())
+        h_post = 2.0 * torch.sigmoid(
+            self.alpha_post.float() * post + self.b_post.float()
+        )
         h_res = _sinkhorn(
             self.alpha_res.float() * res.view(t, n, n) + self.b_res.float(), self.iters
         )
@@ -177,10 +197,14 @@ class OellmLDMNet(nn.Module):
     def forward(self, x: torch.Tensor):
         xf = x.float()
         w1 = self.w1.weight
-        xn = (xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.eps)).to(w1.dtype)
+        xn = (xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.eps)).to(
+            w1.dtype
+        )
         hidden = F.silu(F.linear(xn, w1 * self.norm_weight.to(w1.dtype), self.w1.bias))
         shape = (*x.shape[:-1], self.groups, self.key_dim)
-        address = F.normalize(self.address(hidden).float().view(shape), dim=-1, eps=1e-6)
+        address = F.normalize(
+            self.address(hidden).float().view(shape), dim=-1, eps=1e-6
+        )
         return address, 2.0 * torch.sigmoid(self.gate(hidden).float())
 
 
@@ -215,7 +239,9 @@ def ldm_step(write, read, x, value, memory, covariance):
     u = vbar - torch.einsum("...gkd,...gk->...gd", memory, kbar)
     kp = torch.einsum("...gi,...gij->...gj", kbar, covariance)
     memory = memory + kappa.unsqueeze(-1) * u.unsqueeze(-2)
-    covariance = (covariance - kappa.unsqueeze(-1) * kp.unsqueeze(-2)) / lam[:, None, None]
+    covariance = (covariance - kappa.unsqueeze(-1) * kp.unsqueeze(-2)) / lam[
+        :, None, None
+    ]
     r = torch.einsum("...gkd,...gk->...gd", memory, read.query(x))
     return r.reshape(x.shape).to(x.dtype), memory, covariance
 
@@ -255,7 +281,10 @@ class OellmXSAAttention(nn.Module):
         super().__init__()
         tp, _ = _tp()
         h, d = config.hidden_size, config.head_dim
-        self.total_heads, self.total_kv = config.num_attention_heads, config.num_key_value_heads
+        self.total_heads, self.total_kv = (
+            config.num_attention_heads,
+            config.num_key_value_heads,
+        )
         assert self.total_heads % tp == 0
         self.nh = self.total_heads // tp
         self.nkv = max(1, self.total_kv // tp)
@@ -263,7 +292,12 @@ class OellmXSAAttention(nn.Module):
         self.rep = self.nh // self.nkv
         self.xsa, self.xsa_eps = config.exclusive_self_attention, config.xsa_eps
         self.qkv_proj = QKVParallelLinear(
-            h, d, self.total_heads, self.total_kv, bias=False, prefix=f"{prefix}.qkv_proj"
+            h,
+            d,
+            self.total_heads,
+            self.total_kv,
+            bias=False,
+            prefix=f"{prefix}.qkv_proj",
         )
         self.gate_proj = (
             ColumnParallelLinear(
@@ -276,8 +310,12 @@ class OellmXSAAttention(nn.Module):
             self.total_heads * d, h, bias=False, prefix=f"{prefix}.o_proj"
         )
         zcg = config.layernorm_zero_centered_gamma
-        self.q_norm = OellmRMSNorm(d, config.rms_norm_eps, zcg) if config.qk_layernorm else None
-        self.k_norm = OellmRMSNorm(d, config.rms_norm_eps, zcg) if config.qk_layernorm else None
+        self.q_norm = (
+            OellmRMSNorm(d, config.rms_norm_eps, zcg) if config.qk_layernorm else None
+        )
+        self.k_norm = (
+            OellmRMSNorm(d, config.rms_norm_eps, zcg) if config.qk_layernorm else None
+        )
         self.attn = Attention(
             self.nh,
             d,
@@ -290,8 +328,11 @@ class OellmXSAAttention(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         t = x.shape[0]
         qkv, _ = self.qkv_proj(x)
-        q, k, v = qkv.split([self.nh * self.d, self.nkv * self.d, self.nkv * self.d], dim=-1)
+        q, k, v = qkv.split(
+            [self.nh * self.d, self.nkv * self.d, self.nkv * self.d], dim=-1
+        )
         if self.q_norm is not None:
+            assert self.k_norm is not None
             q = self.q_norm(q.view(t, self.nh, self.d)).view(t, -1)
             k = self.k_norm(k.view(t, self.nkv, self.d)).view(t, -1)
         o = self.attn(q, k, v).view(t, self.nh, self.d)
@@ -303,7 +344,9 @@ class OellmXSAAttention(nn.Module):
             if self.rep > 1:
                 vf = vf.repeat_interleave(self.rep, dim=1)
             of = o.float()
-            c = (of * vf).sum(-1, keepdim=True) / (vf.pow(2).sum(-1, keepdim=True) + self.xsa_eps)
+            c = (of * vf).sum(-1, keepdim=True) / (
+                vf.pow(2).sum(-1, keepdim=True) + self.xsa_eps
+            )
             of = of - c * vf
             if gate is not None:
                 of = of * gate
@@ -337,7 +380,10 @@ class OellmCKDA(MambaBase, nn.Module):
         )
         assert self.head_v_dim == self.head_dim, "expand_v != 1 is not supported"
         self.nh = self.num_heads // self.tp
-        self.key_dim, self.value_dim = self.num_heads * self.head_dim, self.num_v_heads * self.head_v_dim
+        self.key_dim, self.value_dim = (
+            self.num_heads * self.head_dim,
+            self.num_v_heads * self.head_v_dim,
+        )
         self.lk, self.lv = self.key_dim // self.tp, self.value_dim // self.tp
         self.gate = kw.get("gate", "signed_sigmoid2")
         self.signed = is_signed(self.gate)
@@ -355,35 +401,62 @@ class OellmCKDA(MambaBase, nn.Module):
         self.xsa = kw.get("xsa", False)
         self.output_gate = kw.get("output_gate", "lowrank")
 
-        self.q_proj = ColumnParallelLinear(h, self.key_dim, bias=False, prefix=f"{prefix}.q_proj")
-        self.k_proj = ColumnParallelLinear(h, self.key_dim, bias=False, prefix=f"{prefix}.k_proj")
-        self.v_proj = ColumnParallelLinear(h, self.value_dim, bias=False, prefix=f"{prefix}.v_proj")
-        for name, dim in (("q", self.key_dim), ("k", self.key_dim), ("v", self.value_dim)):
-            conv = ColumnParallelLinear(self.conv_size, dim, bias=False, prefix=f"{prefix}.{name}_conv1d")
+        self.q_proj = ColumnParallelLinear(
+            h, self.key_dim, bias=False, prefix=f"{prefix}.q_proj"
+        )
+        self.k_proj = ColumnParallelLinear(
+            h, self.key_dim, bias=False, prefix=f"{prefix}.k_proj"
+        )
+        self.v_proj = ColumnParallelLinear(
+            h, self.value_dim, bias=False, prefix=f"{prefix}.v_proj"
+        )
+        for name, dim in (
+            ("q", self.key_dim),
+            ("k", self.key_dim),
+            ("v", self.value_dim),
+        ):
+            conv = ColumnParallelLinear(
+                self.conv_size, dim, bias=False, prefix=f"{prefix}.{name}_conv1d"
+            )
             conv.weight.data = conv.weight.data.unsqueeze(1)  # [dim, 1, K] as nn.Conv1d
             setattr(self, f"{name}_conv1d", conv)
-        self.f_proj0 = ReplicatedLinear(h, self.head_v_dim, bias=False, prefix=f"{prefix}.f_proj.0")
+        self.f_proj0 = ReplicatedLinear(
+            h, self.head_v_dim, bias=False, prefix=f"{prefix}.f_proj.0"
+        )
         self.f_proj1 = ColumnParallelLinear(
-            self.head_v_dim, self.num_v_heads * self.head_dim, bias=False, prefix=f"{prefix}.f_proj.1"
+            self.head_v_dim,
+            self.num_v_heads * self.head_dim,
+            bias=False,
+            prefix=f"{prefix}.f_proj.1",
         )
         self.b_proj = ColumnParallelLinear(
-            h, self.num_v_heads, bias=kw.get("beta_init_style", "standard") == "spread",
+            h,
+            self.num_v_heads,
+            bias=kw.get("beta_init_style", "standard") == "spread",
             prefix=f"{prefix}.b_proj",
         )
         self.A_log = nn.Parameter(torch.zeros(self.nh, dtype=torch.float32))
-        self.dt_bias = nn.Parameter(torch.zeros(self.nh * self.head_dim, dtype=torch.float32))
+        self.dt_bias = nn.Parameter(
+            torch.zeros(self.nh * self.head_dim, dtype=torch.float32)
+        )
         self.A_log.weight_loader = _tp_shard_loader
         self.dt_bias.weight_loader = _tp_shard_loader
         if self.output_gate == "lowrank":
-            self.g_proj0 = ReplicatedLinear(h, self.head_v_dim, bias=False, prefix=f"{prefix}.g_proj.0")
+            self.g_proj0 = ReplicatedLinear(
+                h, self.head_v_dim, bias=False, prefix=f"{prefix}.g_proj.0"
+            )
             self.g_proj1 = ColumnParallelLinear(
                 self.head_v_dim, self.value_dim, bias=True, prefix=f"{prefix}.g_proj.1"
             )
         else:
-            self.g_proj = ColumnParallelLinear(h, self.value_dim, bias=True, prefix=f"{prefix}.g_proj")
+            self.g_proj = ColumnParallelLinear(
+                h, self.value_dim, bias=True, prefix=f"{prefix}.g_proj"
+            )
         self.o_norm_weight = nn.Parameter(torch.ones(self.head_v_dim))
         self.o_norm_eps = kw.get("norm_eps", 1e-5)
-        self.o_proj = RowParallelLinear(self.value_dim, h, bias=False, prefix=f"{prefix}.o_proj")
+        self.o_proj = RowParallelLinear(
+            self.value_dim, h, bias=False, prefix=f"{prefix}.o_proj"
+        )
 
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -415,7 +488,9 @@ class OellmCKDA(MambaBase, nn.Module):
     def _o_norm(self, o: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         of = o.float()
         of = of * torch.rsqrt(of.pow(2).mean(-1, keepdim=True) + self.o_norm_eps)
-        return (of * self.o_norm_weight.float() * torch.sigmoid(gate.float())).to(o.dtype)
+        return (of * self.o_norm_weight.float() * torch.sigmoid(gate.float())).to(
+            o.dtype
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from fla.layers.complex_kda_layer import compute_gate
@@ -446,14 +521,23 @@ class OellmCKDA(MambaBase, nn.Module):
             w = w.view(w.size(0), w.size(2))
             if prefill:
                 z = causal_conv1d_fn(
-                    z.transpose(0, 1), w, None, conv_states=cs[name],
-                    query_start_loc=m.non_spec_query_start_loc, cache_indices=idx,
-                    has_initial_state=m.has_initial_state, activation=self.conv_act[name],
+                    z.transpose(0, 1),
+                    w,
+                    None,
+                    conv_states=cs[name],
+                    query_start_loc=m.non_spec_query_start_loc,
+                    cache_indices=idx,
+                    has_initial_state=m.has_initial_state,
+                    activation=self.conv_act[name],
                     metadata=m,
                 ).transpose(0, 1)
             else:
                 z = causal_conv1d_update(
-                    z.contiguous(), cs[name], w, None, activation=self.conv_act[name],
+                    z.contiguous(),
+                    cs[name],
+                    w,
+                    None,
+                    activation=self.conv_act[name],
                     conv_state_indices=idx[:n],
                 )
             outs.append(z)
@@ -476,18 +560,35 @@ class OellmCKDA(MambaBase, nn.Module):
         kernel = chunk_kda if prefill else fused_recurrent_kda
         extra = {"safe_gate": self.safe_gate} if prefill else {}
         o, final = kernel(
-            q=q, k=k, v=v, g=g, beta=beta, sign=sign, scale=self.head_dim**-0.5,
-            initial_state=init, output_final_state=True, use_qk_l2norm_in_kernel=True,
-            use_gate_in_kernel=False, use_beta_sigmoid_in_kernel=True,
-            allow_neg_eigval=self.allow_neg_eigval, lower_bound=self.lower_bound,
-            state_v_first=True, cu_seqlens=cu.long(), **extra,
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            sign=sign,
+            scale=self.head_dim**-0.5,
+            initial_state=init,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=False,
+            use_beta_sigmoid_in_kernel=True,
+            allow_neg_eigval=self.allow_neg_eigval,
+            lower_bound=self.lower_bound,
+            state_v_first=True,
+            cu_seqlens=cu.long(),
+            **extra,
         )
         rec_state[idx[: final.shape[0]]] = final.to(rec_state.dtype)
         if self.xsa:
             from fla.modules.xsa import exclusive_self_attention
 
-            o = exclusive_self_attention(o.reshape(-1, *o.shape[-2:]), v.reshape(-1, *v.shape[-2:])).view_as(o)
-        o = self._o_norm(o.reshape(n, self.nh, self.head_v_dim), gate_out.view(n, self.nh, self.head_v_dim))
+            o = exclusive_self_attention(
+                o.reshape(-1, *o.shape[-2:]), v.reshape(-1, *v.shape[-2:])
+            ).view_as(o)
+        o = self._o_norm(
+            o.reshape(n, self.nh, self.head_v_dim),
+            gate_out.view(n, self.nh, self.head_v_dim),
+        )
         out = self.o_proj(o.reshape(n, -1))[0]
         if n < t:
             out = torch.cat([out, out.new_zeros(t - n, out.shape[-1])])
@@ -511,8 +612,10 @@ def _swiglu(gate, up, limit, norm=None):
 
 
 class _Fp8Experts:
-    """Stacked fp8 expert weights [E, rows, cols] (uint8 E4M3 bytes + fp32 scales [E, rows, cols /
-    block]), indexed like the bf16 stack: [e] / [e, a:b] dequantize that slice to bf16."""
+    """Stacked fp8 expert weights [E, rows, cols] (uint8 E4M3 bytes + fp32 scales [E,
+    rows, cols /
+    block]), indexed like the bf16 stack: [e] / [e, a:b] dequantize that slice to
+    bf16."""
 
     def __init__(self, q: torch.Tensor, scale: torch.Tensor, block: int) -> None:
         self.q, self.scale, self.block = q, scale, block
@@ -520,15 +623,22 @@ class _Fp8Experts:
     def __getitem__(self, idx) -> torch.Tensor:
         q = self.q[idx].view(torch.float8_e4m3fn).float()
         s = self.scale[idx].float()
-        return (q.view(*q.shape[:-1], -1, self.block) * s[..., None]).view(q.shape).to(torch.bfloat16)
+        return (
+            (q.view(*q.shape[:-1], -1, self.block) * s[..., None])
+            .view(q.shape)
+            .to(torch.bfloat16)
+        )
 
 
 class OellmMoE(nn.Module):
-    """Sigmoid router (fp32 logits) with expert-bias (top-k on scores + bias) or quantile
+    """Sigmoid router (fp32 logits) with expert-bias (top-k on scores + bias) or
+    quantile
     balancing (top-k on logits - qb_beta) selection; weights = the unbiased scores
-    renormalised, times the scaling factor. Routed experts on vLLM's FusedMoE (TP / EP, fused
+    renormalised, times the scaling factor. Routed experts on vLLM's FusedMoE (TP / EP,
+    fused
     kernels) with the SwiGLU clamp (``swiglu_limit``) and the post-activation bound
-    (``post_act_norm``); ``OELLM_MOE=naive`` keeps a per-expert loop over TP-sharded experts.
+    (``post_act_norm``); ``OELLM_MOE=naive`` keeps a per-expert loop over TP-sharded
+    experts.
     The ungated shared expert is replicated."""
 
     def __init__(self, config, prefix: str) -> None:
@@ -536,9 +646,16 @@ class OellmMoE(nn.Module):
         self.tp, self.tp_rank = _tp()
         h, e, i = config.hidden_size, config.num_experts, config.moe_intermediate_size
         self.num_experts, self.inter = e, i
-        self.top_k, self.scaling = config.num_experts_per_tok, config.router_scaling_factor
+        self.top_k, self.scaling = (
+            config.num_experts_per_tok,
+            config.router_scaling_factor,
+        )
         self.limit = config.activation_clamp_value
-        pab = (config.rms_norm_eps, config.post_act_norm_floor, config.post_act_norm_smooth)
+        pab = (
+            config.rms_norm_eps,
+            config.post_act_norm_floor,
+            config.post_act_norm_smooth,
+        )
         self.expert_norm = pab if config.moe_expert_post_act_norm else None
         self.shared_norm = pab if config.mlp_post_act_norm else None
         self.quantile = config.router_balancing == "quantile"
@@ -549,25 +666,53 @@ class OellmMoE(nn.Module):
         self.block = int(config.expert_scale_block)
         self.impl = os.environ.get("OELLM_MOE", "fused")
         assert self.impl in ("fused", "naive"), self.impl
+        self.local_expert_ids = None
         if self.impl == "fused":
             from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 
-            # the bound is an RMS over each expert's whole intermediate row: under plain TP
-            # FusedMoE splits that row over the ranks (each would bound its slice), under EP
+            # the bound is an RMS over each expert's whole intermediate row: under plain
+            # TP
+            # FusedMoE splits that row over the ranks (each would bound its slice),
+            # under EP
             # every rank holds whole experts
             pc = get_current_vllm_config().parallel_config
-            if self.expert_norm is not None and self.tp > 1 and not pc.enable_expert_parallel:
+            if (
+                self.expert_norm is not None
+                and self.tp > 1
+                and not pc.enable_expert_parallel
+            ):
                 raise ValueError(
                     "the post-activation bound needs whole experts per rank: run with "
-                    "--enable-expert-parallel (or OELLM_MOE=naive) under tensor parallelism"
+                    "--enable-expert-parallel (or OELLM_MOE=naive) "
+                    "under tensor parallelism"
                 )
 
             self.experts = FusedMoEFactory(
-                num_experts=e, top_k=self.top_k, hidden_size=h, intermediate_size=i,
-                renormalize=True, custom_routing_function=self._route, scoring_func="sigmoid",
-                activation="silu", swiglu_limit=self.limit, post_act_norm=self.expert_norm,
-                reduce_results=True, prefix=f"{prefix}.experts",
+                num_experts=e,
+                top_k=self.top_k,
+                hidden_size=h,
+                intermediate_size=i,
+                renormalize=True,
+                custom_routing_function=self._route,
+                scoring_func="sigmoid",
+                activation="silu",
+                swiglu_limit=self.limit,
+                post_act_norm=self.expert_norm,
+                reduce_results=True,
+                prefix=f"{prefix}.experts",
             )
+            if os.environ.get("OELLM_LOCAL_EXPERT_LOAD", "0") == "1":
+                from vllm.model_executor.model_loader.ep_weight_filter import (
+                    compute_local_expert_ids,
+                )
+
+                group = get_ep_group()
+                self.local_expert_ids = compute_local_expert_ids(
+                    e,
+                    group.world_size,
+                    group.rank_in_group,
+                    pc.expert_placement_strategy,
+                )
         else:
             assert e % self.tp == 0, f"{e} experts do not divide over {self.tp} ranks"
             self.local = e // self.tp
@@ -590,15 +735,20 @@ class OellmMoE(nn.Module):
         if self.quantile:
             _, idx = torch.topk(logits - self.qb_beta.float(), topk, dim=-1)
         else:
-            _, idx = torch.topk(scores + self.e_score_correction_bias.float(), topk, dim=-1)
+            _, idx = torch.topk(
+                scores + self.e_score_correction_bias.float(), topk, dim=-1
+            )
         w = scores.gather(-1, idx)
         if topk > 1:
             w = w / (w.sum(-1, keepdim=True) + 1e-20)
         return w * self.scaling, idx
 
-    # -- weights: the export stacks [E, 2I, h] (gate | up) and [E, h, I]; with expert_weight_dtype
-    # fp8 as E4M3 bytes (uint8) + fp32 scales per 128 elements of a row (<name>_scale), dequantized
-    # here as Megatron's fsdp_fp8_param_gather does (E4M3 -> fp32, times the scale, one bf16
+    # -- weights: the export stacks [E, 2I, h] (gate | up) and [E, h, I]; with
+    # expert_weight_dtype
+    # fp8 as E4M3 bytes (uint8) + fp32 scales per 128 elements of a row (<name>_scale),
+    # dequantized
+    # here as Megatron's fsdp_fp8_param_gather does (E4M3 -> fp32, times the scale, one
+    # bf16
     # rounding): the experts hold exactly the weights the run's forward used
     def load_stacked(self, name: str, w: torch.Tensor) -> None:
         if self.fp8:
@@ -614,14 +764,27 @@ class OellmMoE(nn.Module):
             param.data.copy_(w[self.first : self.first + self.local])
             return
         params = dict(self.experts.named_parameters())
+        expert_ids = (
+            sorted(self.local_expert_ids)
+            if self.local_expert_ids is not None
+            else range(self.num_experts)
+        )
         if name == "gate_up_proj":
-            (pname, param), = [(n, p) for n, p in params.items() if n.endswith("w13_weight")]
-            for ex in range(self.num_experts):
-                param.weight_loader(param, w[ex, : self.inter], pname, shard_id="w1", expert_id=ex)
-                param.weight_loader(param, w[ex, self.inter :], pname, shard_id="w3", expert_id=ex)
+            ((pname, param),) = [
+                (n, p) for n, p in params.items() if n.endswith("w13_weight")
+            ]
+            for ex in expert_ids:
+                param.weight_loader(
+                    param, w[ex, : self.inter], pname, shard_id="w1", expert_id=ex
+                )
+                param.weight_loader(
+                    param, w[ex, self.inter :], pname, shard_id="w3", expert_id=ex
+                )
         else:
-            (pname, param), = [(n, p) for n, p in params.items() if n.endswith("w2_weight")]
-            for ex in range(self.num_experts):
+            ((pname, param),) = [
+                (n, p) for n, p in params.items() if n.endswith("w2_weight")
+            ]
+            for ex in expert_ids:
                 param.weight_loader(param, w[ex], pname, shard_id="w2", expert_id=ex)
 
     def _expert_loader(self, param: torch.Tensor, loaded: torch.Tensor) -> None:
@@ -635,7 +798,12 @@ class OellmMoE(nn.Module):
             out = self._naive(x, logits)
         if self.shared:
             out = out + self.shared_down_proj(
-                _swiglu(self.shared_gate_proj(x), self.shared_up_proj(x), self.limit, self.shared_norm)
+                _swiglu(
+                    self.shared_gate_proj(x),
+                    self.shared_up_proj(x),
+                    self.limit,
+                    self.shared_norm,
+                )
             )
         return out
 
@@ -658,7 +826,9 @@ class OellmMoE(nn.Module):
                 tk, sl = tok[start : start + c], slot[start : start + c]
                 start += c
                 gt, up = F.linear(x[tk], self.gate_up_proj[e]).chunk(2, dim=-1)
-                y = F.linear(_swiglu(gt, up, self.limit, self.expert_norm), self.down_proj[e])
+                y = F.linear(
+                    _swiglu(gt, up, self.limit, self.expert_norm), self.down_proj[e]
+                )
                 out.index_add_(0, tk, (y * w[tk, sl, None]).to(out.dtype))
         if self.tp > 1:
             out = tensor_model_parallel_all_reduce(out)
@@ -666,22 +836,37 @@ class OellmMoE(nn.Module):
 
 
 # ----------------------------------------------------------------------- Engram
-_ST_DTYPES = {"BF16": (np.uint16, torch.bfloat16), "F16": (np.uint16, torch.float16),
-              "F32": (np.float32, torch.float32)}
+_ST_DTYPES = {
+    "BF16": (np.uint16, torch.bfloat16),
+    "F16": (np.uint16, torch.float16),
+    "F32": (np.float32, torch.float32),
+}
 
 
 def _safetensors_memmap(model_dir: str, name: str) -> torch.Tensor:
-    """A tensor of an exported checkpoint mapped from its safetensors shard (copy-on-write, so
+    """A tensor of an exported checkpoint mapped from its safetensors shard
+    (copy-on-write, so
     no copy is made and the page cache is shared by every process on the node)."""
     index = os.path.join(model_dir, "model.safetensors.index.json")
-    fname = json.load(open(index))["weight_map"][name] if os.path.exists(index) else "model.safetensors"
+    if os.path.exists(index):
+        with open(index) as stream:
+            fname = json.load(stream)["weight_map"][name]
+    else:
+        fname = "model.safetensors"
     path = os.path.join(model_dir, fname)
     with open(path, "rb") as f:
         n = struct.unpack("<Q", f.read(8))[0]
         meta = json.loads(f.read(n))[name]
     np_dtype, dtype = _ST_DTYPES[meta["dtype"]]
     start, _ = meta["data_offsets"]
-    arr = np.memmap(path, dtype=np_dtype, mode="c", offset=8 + n + start, shape=tuple(meta["shape"]))
+    arr = np.memmap(
+        path, dtype=np_dtype, mode="c", offset=8 + n + start, shape=tuple(meta["shape"])
+    )
+    advice = os.environ.get("OELLM_ENGRAM_MADVISE", "normal")
+    if advice == "random":
+        arr._mmap.madvise(mmap.MADV_RANDOM)
+    elif advice != "normal":
+        raise ValueError(f"Unknown OELLM_ENGRAM_MADVISE: {advice}")
     return torch.from_numpy(arr).view(dtype)
 
 
@@ -690,7 +875,9 @@ class OellmEngram(MambaBase, nn.Module):
     the depthwise conv window ``[h, (kernel - 1) * dilation]`` and the last
     ``max(orders) - 1`` shifted token ids (short-conv metadata)."""
 
-    def __init__(self, config, layer_idx: int, vllm_config: VllmConfig, prefix: str) -> None:
+    def __init__(
+        self, config, layer_idx: int, vllm_config: VllmConfig, prefix: str
+    ) -> None:
         super().__init__()
         h = config.hidden_size
         self.h = h
@@ -704,33 +891,54 @@ class OellmEngram(MambaBase, nn.Module):
         self.offsets = [0]
         for n in self.sizes[:-1]:
             self.offsets.append(self.offsets[-1] + n)
-        self.hash_mult = [[int(a) for a in r] for r in config.engram_hash_multipliers[str(layer_idx)]]
+        self.hash_mult = [
+            [int(a) for a in r] for r in config.engram_hash_multipliers[str(layer_idx)]
+        ]
         self.use_token_map = bool(config.engram_token_map)
         if self.use_token_map:
-            self.register_buffer("token_map", torch.zeros(config.vocab_size, dtype=torch.long))
+            self.register_buffer(
+                "token_map", torch.zeros(config.vocab_size, dtype=torch.long)
+            )
         table_dtype = getattr(config, "engram_table_dtype", None) or "bf16"
-        assert table_dtype in ("bf16", "fp32"), f"engram_table_dtype {table_dtype} not supported"
+        assert table_dtype in ("bf16", "fp32"), (
+            f"engram_table_dtype {table_dtype} not supported"
+        )
         self.dim = config.engram_embed_dim
-        # OELLM_ENGRAM_TABLES: "mmap" (default: the export's shard mapped, rows read through the
-        # page cache, shared by the node's ranks), "ram" (the same, read once at load: resident),
+        # OELLM_ENGRAM_TABLES: "mmap" (default: the export's shard mapped, rows read
+        # through the
+        # page cache, shared by the node's ranks), "ram" (the same, read once at load:
+        # resident),
         # "gpu" (rows sharded over the TP ranks in GPU memory, an all-reduce per lookup)
         self.table_mode = os.environ.get("OELLM_ENGRAM_TABLES", "mmap")
         assert self.table_mode in ("mmap", "ram", "gpu"), self.table_mode
-        self.model_dir = vllm_config.model_config.model
+        self.model_dir = os.environ.get(
+            "OELLM_ENGRAM_MODEL_DIR", vllm_config.model_config.model
+        )
+        self.lookup_mode = os.environ.get("OELLM_ENGRAM_LOOKUP", "replicated")
+        if self.lookup_mode not in ("replicated", "leader"):
+            raise ValueError(f"Unknown OELLM_ENGRAM_LOOKUP: {self.lookup_mode}")
         self.host_table: torch.Tensor | None = None
         if self.table_mode != "gpu":
-            from vllm.model_executor.model_loader.ep_weight_filter import skip_weight_name
+            from vllm.model_executor.model_loader.ep_weight_filter import (
+                skip_weight_name,
+            )
 
-            skip_weight_name(f"{prefix}.table")  # mapped from the shard, never read by the loader
+            skip_weight_name(
+                f"{prefix}.table"
+            )  # mapped from the shard, never read by the loader
         if self.table_mode == "gpu":
             self.table = VocabParallelEmbedding(
-                sum(self.sizes), self.dim,
+                sum(self.sizes),
+                self.dim,
                 params_dtype=torch.float32 if table_dtype == "fp32" else None,
                 prefix=f"{prefix}.table",
             )
         self.sign_hash = bool(getattr(config, "engram_sign_hash", False))
         if self.sign_hash:
-            self.sign_mult = [[int(a) for a in r] for r in config.engram_sign_multipliers[str(layer_idx)]]
+            self.sign_mult = [
+                [int(a) for a in r]
+                for r in config.engram_sign_multipliers[str(layer_idx)]
+            ]
             self.sign_size = int(config.engram_sign_table_size)
             self.register_buffer("sign_table", torch.ones(self.sign_size, self.dim))
         mem = self.dim * len(self.sizes)
@@ -739,8 +947,12 @@ class OellmEngram(MambaBase, nn.Module):
         self.hidden_norm = OellmRMSNorm(h, config.rms_norm_eps)
         self.key_norm = OellmRMSNorm(h, config.rms_norm_eps)
         self.signed_sqrt = config.engram_gate_signed_sqrt
-        self.conv_norm = OellmRMSNorm(h, config.rms_norm_eps) if config.engram_conv_prenorm else None
-        self.conv1d = nn.Conv1d(h, h, self.kernel_size, groups=h, bias=False, dilation=self.dilation)
+        self.conv_norm = (
+            OellmRMSNorm(h, config.rms_norm_eps) if config.engram_conv_prenorm else None
+        )
+        self.conv1d = nn.Conv1d(
+            h, h, self.kernel_size, groups=h, bias=False, dilation=self.dilation
+        )
 
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -777,11 +989,27 @@ class OellmEngram(MambaBase, nn.Module):
         """Table rows ``[..., L]`` -> ``[..., L, dim]``."""
         if self.table_mode == "gpu":
             return self.table(rows)
+        group = get_tp_group()
+        if self.lookup_mode == "leader" and group.world_size > 1:
+            if group.rank_in_group == 0:
+                result = self._lookup_host(rows)
+            else:
+                result = torch.empty(
+                    (*rows.shape, self.dim),
+                    dtype=self._host().dtype,
+                    device=rows.device,
+                )
+            return group.broadcast(result, src=0)
+        return self._lookup_host(rows)
+
+    def _lookup_host(self, rows: torch.Tensor) -> torch.Tensor:
         uniq, inv = torch.unique(rows.flatten().cpu(), return_inverse=True)
         got = self._host()[uniq].to(rows.device, non_blocking=True)
         return got[inv.to(rows.device)].view(*rows.shape, self.dim)
 
-    def _rows(self, shifted: torch.Tensor, s: int, mult, sizes, offsets) -> torch.Tensor:
+    def _rows(
+        self, shifted: torch.Tensor, s: int, mult, sizes, offsets
+    ) -> torch.Tensor:
         p = self.hist
         history = [shifted[p - i : p - i + s] for i in range(max(self.orders))]
         out, lookup = [], 0
@@ -795,20 +1023,28 @@ class OellmEngram(MambaBase, nn.Module):
         return torch.stack(out, dim=-1)
 
     def _seq_rows(self, ids: torch.Tensor, id_state: torch.Tensor):
-        """ids [s] (one request), id_state [hist] -> (rows [s, L], sign rows, new id state)."""
+        """Ids [s] (one request), id_state [hist] -> (rows [s, L], sign rows, new id
+        state)."""
         shifted = torch.cat([id_state, ids.long() + 1])
         s = ids.shape[0]
         rows = self._rows(shifted, s, self.hash_mult, self.sizes, self.offsets)
         signs = None
         if self.sign_hash:
             n = len(self.sizes)
-            signs = self._rows(shifted, s, self.sign_mult, [self.sign_size] * n, [0] * n)
+            signs = self._rows(
+                shifted, s, self.sign_mult, [self.sign_size] * n, [0] * n
+            )
         return rows, signs, shifted[shifted.shape[0] - self.hist :]
 
     def _conv(self, v: torch.Tensor, state: torch.Tensor):
-        """v [s, h], state [h, pad] -> (conv [s, h], new state)."""
+        """V [s, h], state [h, pad] -> (conv [s, h], new state)."""
         padded = torch.cat([state.to(v.dtype), v.transpose(0, 1)], dim=-1)
-        conv = F.conv1d(padded.unsqueeze(0), self.conv1d.weight, groups=self.h, dilation=self.dilation)
+        conv = F.conv1d(
+            padded.unsqueeze(0),
+            self.conv1d.weight,
+            groups=self.h,
+            dilation=self.dilation,
+        )
         return conv[0].transpose(0, 1), padded[:, padded.shape[-1] - self.pad :]
 
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
@@ -848,7 +1084,9 @@ class OellmEngram(MambaBase, nn.Module):
         e = e.reshape(n, -1)
         xs = x[:n]
         kk, vv = self.key_proj(e), self.value_proj(e)
-        gate = (self.hidden_norm(xs).float() * self.key_norm(kk).float()).sum(-1, keepdim=True) / self.h**0.5
+        gate = (self.hidden_norm(xs).float() * self.key_norm(kk).float()).sum(
+            -1, keepdim=True
+        ) / self.h**0.5
         if self.signed_sqrt:
             gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
         vv = torch.sigmoid(gate).to(vv.dtype) * vv
@@ -870,7 +1108,9 @@ class OellmEngram(MambaBase, nn.Module):
 
 # ----------------------------------------------------------------------- layers
 class OellmAmbitiousLayer(nn.Module):
-    def __init__(self, config, layer_idx: int, vllm_config: VllmConfig, prefix: str) -> None:
+    def __init__(
+        self, config, layer_idx: int, vllm_config: VllmConfig, prefix: str
+    ) -> None:
         super().__init__()
         self.kind = config.block_types[layer_idx]
         self.ldm = config.residual == "ldm"
@@ -880,7 +1120,9 @@ class OellmAmbitiousLayer(nn.Module):
             self.mhc = OellmMHC(config)
         zcg = config.layernorm_zero_centered_gamma
         if self.kind != "engram":
-            self.input_layernorm = OellmRMSNorm(config.hidden_size, config.rms_norm_eps, zcg)
+            self.input_layernorm = OellmRMSNorm(
+                config.hidden_size, config.rms_norm_eps, zcg
+            )
         if self.kind == "attention":
             self.mixer = OellmXSAAttention(config, vllm_config, f"{prefix}.mixer")
         elif self.kind == "ckda":
@@ -901,7 +1143,12 @@ class OellmAmbitiousLayer(nn.Module):
             out = self._sublayer(x + r, input_ids)
             x = x + out
             r, memory, covariance = ldm_step(
-                self.ldm_mixer.write_site, self.ldm_mixer.next_query, x, out, memory, covariance
+                self.ldm_mixer.write_site,
+                self.ldm_mixer.next_query,
+                x,
+                out,
+                memory,
+                covariance,
             )
             return x, r, memory, covariance
         x, pending = self.mhc.read(streams)
@@ -909,7 +1156,8 @@ class OellmAmbitiousLayer(nn.Module):
 
 
 class OellmEmbedNorm(nn.Module):
-    """Megatron's embedding_norm: an fp32 RMSNorm of the embedding output with a learnable gain
+    """Megatron's embedding_norm: an fp32 RMSNorm of the embedding output with a
+    learnable gain
     (the export's model.embed_norm.weight)."""
 
     def __init__(self, hidden: int, eps: float) -> None:
@@ -918,7 +1166,9 @@ class OellmEmbedNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.rms_norm(x.float(), (x.shape[-1],), self.weight.float(), self.eps).to(x.dtype)
+        return F.rms_norm(x.float(), (x.shape[-1],), self.weight.float(), self.eps).to(
+            x.dtype
+        )
 
 
 class OellmAmbitiousModel(nn.Module):
@@ -929,11 +1179,14 @@ class OellmAmbitiousModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size, prefix=f"{prefix}.embed_tokens"
         )
-        # the export's embedding output: x * embedding_multiplier, then (embedding_norm) an fp32
+        # the export's embedding output: x * embedding_multiplier, then (embedding_norm)
+        # an fp32
         # RMSNorm with a learnable gain (Megatron LanguageModelEmbedding)
         self.embed_scale = float(config.embedding_multiplier)
         self.embed_norm = (
-            OellmEmbedNorm(config.hidden_size, config.rms_norm_eps) if config.embedding_norm else None
+            OellmEmbedNorm(config.hidden_size, config.rms_norm_eps)
+            if config.embedding_norm
+            else None
         )
         self.ldm = config.residual == "ldm"
         self.ldm_boundary = OellmLDMBoundary(config) if self.ldm else None
@@ -942,7 +1195,9 @@ class OellmAmbitiousModel(nn.Module):
             for i in range(config.num_hidden_layers)
         )
         self.norm = OellmRMSNorm(
-            config.hidden_size, config.rms_norm_eps, config.layernorm_zero_centered_gamma
+            config.hidden_size,
+            config.rms_norm_eps,
+            config.layernorm_zero_centered_gamma,
         )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states"], config.hidden_size
@@ -951,7 +1206,9 @@ class OellmAmbitiousModel(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
-    def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None):
+    def forward(
+        self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None
+    ):
         assert get_pp_group().world_size == 1, "pipeline parallelism is not supported"
         assert input_ids is not None, "the Engram layers need input_ids"
         x = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
@@ -960,6 +1217,7 @@ class OellmAmbitiousModel(nn.Module):
         if self.embed_norm is not None:
             x = self.embed_norm(x)
         if self.ldm:
+            assert self.ldm_boundary is not None
             streams = self.ldm_boundary.enter(x)
         else:
             n = self.config.mhc_expansion_rate
@@ -970,7 +1228,8 @@ class OellmAmbitiousModel(nn.Module):
         return self.norm(h)
 
 
-# Fields later exports added, with the defaults of the export's config class: an older export's
+# Fields later exports added, with the defaults of the export's config class: an older
+# export's
 # bundled configuration file does not define them.
 _CONFIG_DEFAULTS = {
     "residual": "mhc",
@@ -1003,16 +1262,22 @@ class OellmAmbitiousForCausalLM(nn.Module, HasInnerState, IsHybrid):
         self.config = config
         self.vllm_config = vllm_config
         self.model = OellmAmbitiousModel(vllm_config=vllm_config, prefix="model")
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, prefix="lm_head")
+        self.lm_head = ParallelLMHead(
+            config.vocab_size, config.hidden_size, prefix="lm_head"
+        )
         if config.tie_word_embeddings:
             self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
         self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
-    def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None):
+    def forward(
+        self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None
+    ):
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
@@ -1025,7 +1290,9 @@ class OellmAmbitiousForCausalLM(nn.Module, HasInnerState, IsHybrid):
     @classmethod
     def get_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig):
         return MambaStateDtypeCalculator.kda_state_dtype(
-            vllm_config.model_config.dtype, vllm_config.cache_config.mamba_cache_dtype, "float32"
+            vllm_config.model_config.dtype,
+            vllm_config.cache_config.mamba_cache_dtype,
+            "float32",
         )
 
     @classmethod
@@ -1053,15 +1320,19 @@ class OellmAmbitiousForCausalLM(nn.Module, HasInnerState, IsHybrid):
             if shard == "moe_stacked":
                 mod, pname = target.rsplit(".", 1)
                 modules[mod].load_stacked(pname, w)
-                loaded.update(n for n in params if n.startswith(mod + ".experts.") or n == target)
+                loaded.update(
+                    n for n in params if n.startswith(mod + ".experts.") or n == target
+                )
                 continue
             if shard == "host_table":
-                if target not in params:  # OELLM_ENGRAM_TABLES mmap / ram: mapped from the shard
+                if (
+                    target not in params
+                ):  # OELLM_ENGRAM_TABLES mmap / ram: mapped from the shard
                     continue
                 shard = None
             if target in params:
                 p = params[target]
-                loader = getattr(p, "weight_loader", default_weight_loader)
+                loader: Callable = getattr(p, "weight_loader", default_weight_loader)
                 if shard is not None:
                     loader(p, w, shard)
                 else:
@@ -1071,7 +1342,9 @@ class OellmAmbitiousForCausalLM(nn.Module, HasInnerState, IsHybrid):
                 buffers[target].copy_(w.to(buffers[target].dtype))
                 loaded.add(target)
             else:
-                raise KeyError(f"no parameter for checkpoint tensor {name} (-> {target})")
+                raise KeyError(
+                    f"no parameter for checkpoint tensor {name} (-> {target})"
+                )
         missing = sorted(set(params) - loaded)
         if missing:
             raise ValueError(f"parameters not in the checkpoint: {missing[:10]} ...")
@@ -1097,7 +1370,10 @@ class OellmAmbitiousForCausalLM(nn.Module, HasInnerState, IsHybrid):
                     "o_norm.weight": "o_norm_weight",
                 }.get(tail, tail)
             elif kind == "moe" and tail in (
-                "gate_up_proj", "down_proj", "gate_up_proj_scale", "down_proj_scale"
+                "gate_up_proj",
+                "down_proj",
+                "gate_up_proj_scale",
+                "down_proj_scale",
             ):
                 return pre + tail, "moe_stacked"
             elif kind == "engram" and tail == "table":
