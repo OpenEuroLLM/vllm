@@ -1346,6 +1346,7 @@ class OellmAmbitiousModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
+        self.graph_max_rows = vllm_config.scheduler_config.max_num_seqs
         self.config = config
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size, prefix=f"{prefix}.embed_tokens"
@@ -1408,7 +1409,10 @@ class OellmAmbitiousModel(nn.Module):
             and x.is_cuda
             and x.shape[0] > 0
             and (x.shape[0] & (x.shape[0] - 1)) == 0
-            and x.shape[0] <= int(os.environ.get("OELLM_GRAPH_MAX_ROWS", "256"))
+            and x.shape[0]
+            <= min(
+                self.graph_max_rows, int(os.environ.get("OELLM_GRAPH_MAX_ROWS", "256"))
+            )
             and (
                 meta is None or (meta.num_prefills == 0 and meta.num_decode_tokens > 0)
             )
