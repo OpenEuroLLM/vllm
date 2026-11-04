@@ -904,6 +904,21 @@ _ST_DTYPES = {
 }
 
 
+def _safetensors_location(model_dir: str, name: str) -> tuple[str, int, dict]:
+    """(shard path, data offset, header entry) of ``name`` in an exported checkpoint."""
+    index = os.path.join(model_dir, "model.safetensors.index.json")
+    if os.path.exists(index):
+        with open(index) as stream:
+            fname = json.load(stream)["weight_map"][name]
+    else:
+        fname = "model.safetensors"
+    path = os.path.join(model_dir, fname)
+    with open(path, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        meta = json.loads(f.read(n))[name]
+    return path, 8 + n + meta["data_offsets"][0], meta
+
+
 def _safetensors_memmap(model_dir: str, name: str) -> torch.Tensor:
     """A tensor of an exported checkpoint mapped from its safetensors shard
     (copy-on-write, so
@@ -1064,9 +1079,11 @@ class OellmEngram(MambaBase, nn.Module):
             if self.uva_table is None:
                 from vllm.model_executor.layers.oellm_uva_table import UvaTable
 
-                src = _safetensors_memmap(self.model_dir, f"{self.prefix}.table")
+                name = f"{self.prefix}.table"
+                src = _safetensors_memmap(self.model_dir, name)
+                path, offset, _ = _safetensors_location(self.model_dir, name)
                 self.uva_table = UvaTable(
-                    src, f"{os.path.realpath(self.model_dir)}:{self.prefix}"
+                    src, (path, offset), f"{os.path.realpath(path)}:{name}"
                 )
             return self.uva_table(rows)
         group = get_tp_group()

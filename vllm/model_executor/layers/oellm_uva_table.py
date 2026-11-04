@@ -13,6 +13,7 @@ import fcntl
 import hashlib
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -49,35 +50,54 @@ def _gather_rows(table, rows, out, n, D: tl.constexpr, BLOCK: tl.constexpr):
     tl.store(out + r[:, None].to(tl.int64) * D + d[None, :], vals, mask=ok[:, None])
 
 
-def _stage(src: torch.Tensor, key: str) -> str:
-    """Copy ``src`` (a mapped export table) once per node into shared memory."""
+def _stage(path: str, offset: int, nbytes: int, key: str) -> str:
+    """Copy ``nbytes`` at ``offset`` of ``path`` (the export's table) once per node into
+    shared memory, with parallel positional reads / writes (no GIL, no page faults)."""
     root = os.environ.get("OELLM_ENGRAM_UVA_DIR", "/dev/shm")
-    path = os.path.join(root, f"oellm_engram_{key}.bin")
-    nbytes = src.numel() * src.element_size()
-    with open(path + ".lock", "a+") as lock:
+    dst = os.path.join(root, f"oellm_engram_{key}.bin")
+    with open(dst + ".lock", "a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if os.path.exists(path + ".done") and os.path.getsize(path) == nbytes:
-            return path
+        if os.path.exists(dst + ".done") and os.path.getsize(dst) == nbytes:
+            return dst
         started = time.perf_counter()
-        flat = src.reshape(-1).view(torch.uint8)
-        with open(path, "wb") as f:
-            step = 1 << 30
-            for a in range(0, nbytes, step):
-                f.write(flat[a : a + step].numpy().tobytes())
-        open(path + ".done", "w").close()
+        step = 256 << 20
+        fi = os.open(path, os.O_RDONLY)
+        fo = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.ftruncate(fo, nbytes)
+
+            def piece(a: int) -> None:
+                n = min(step, nbytes - a)
+                done = 0
+                while done < n:
+                    buf = os.pread(fi, n - done, offset + a + done)
+                    if not buf:
+                        raise EOFError(f"{path}: short read at {offset + a + done}")
+                    os.pwrite(fo, buf, a + done)
+                    done += len(buf)
+
+            with ThreadPoolExecutor(16) as ex:
+                list(ex.map(piece, range(0, nbytes, step)))
+        finally:
+            os.close(fi)
+            os.close(fo)
+        open(dst + ".done", "w").close()
         logger.info(
             "staged Engram table %s: %.1f GB in %.1fs",
-            path,
+            dst,
             nbytes / 1e9,
             time.perf_counter() - started,
         )
-    return path
+    return dst
 
 
 class UvaTable:
     """``rows [...] -> [..., dim]`` from a pinned, node-shared host copy of ``src``."""
 
-    def __init__(self, src: torch.Tensor, ident: str) -> None:
+    def __init__(
+        self, src: torch.Tensor, location: tuple[str, int], ident: str
+    ) -> None:
+        """``src``: the export's mapped table; ``location``: (shard, data offset)."""
         assert src.dim() == 2, src.shape
         self.rows, self.dim = src.shape
         self.dtype = src.dtype
@@ -85,14 +105,14 @@ class UvaTable:
         key = hashlib.sha1(
             f"{ident}:{tuple(src.shape)}:{src.dtype}".encode()
         ).hexdigest()[:16]
-        path = _stage(src, key)
+        nbytes = src.numel() * src.element_size()
+        path = _stage(location[0], location[1], nbytes, key)
         np_dtype = {2: np.uint16, 4: np.uint32}[src.element_size()]
         # MAP_SHARED: every rank pins the same physical pages
         self._arr = np.memmap(
             path, dtype=np_dtype, mode="r+", shape=(self.rows, self.dim)
         )
         self.ptr = self._arr.ctypes.data
-        nbytes = self.rows * self.dim * src.element_size()
         started = time.perf_counter()
         flags = _CUDA_HOST_REGISTER_PORTABLE | _CUDA_HOST_REGISTER_MAPPED
         err = torch.cuda.cudart().cudaHostRegister(self.ptr, nbytes, flags)
