@@ -49,6 +49,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.model_executor.layers import oellm_decode_kernels as decode_kernels
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -530,7 +531,40 @@ class OellmCKDA(MambaBase, nn.Module):
             return self.g_proj1(self.g_proj0(x)[0])[0]
         return self.g_proj(x)[0]
 
+    def _in_proj(self, x: torch.Tensor):
+        """q, k, v, f_proj.0, b, g_proj.0 (lowrank output gate) as one GEMM: the six
+        weights become views of one [sum, h] weight (OELLM_DECODE_KERNELS=triton)."""
+        mods = [self.q_proj, self.k_proj, self.v_proj, self.f_proj0, self.b_proj]
+        if self.output_gate == "lowrank":
+            mods.append(self.g_proj0)
+        if getattr(self, "_in_w", None) is None:
+            ws = [m.weight.data for m in mods]
+            merged = torch.cat(ws)
+            a = 0
+            for m, w in zip(mods, ws):
+                m.weight.data = merged[a : a + w.shape[0]]
+                a += w.shape[0]
+            self._in_w = merged
+            self._in_split = [w.shape[0] for w in ws]
+        parts = list(F.linear(x, self._in_w).split(self._in_split, dim=-1))
+        if self.b_proj.bias is not None:
+            parts[4] = parts[4] + self.b_proj.bias
+        if self.output_gate == "lowrank":
+            gate_out = self.g_proj1(parts[5])[0]
+        else:
+            gate_out = self.g_proj(x)[0]
+        return (
+            parts[0],
+            parts[1],
+            parts[2],
+            self.f_proj1(parts[3])[0],
+            parts[4],
+            gate_out,
+        )
+
     def _o_norm(self, o: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        if decode_kernels.enabled() and o.is_cuda:
+            return decode_kernels.rms_gate(o, gate, self.o_norm_weight, self.o_norm_eps)
         of = o.float()
         of = of * torch.rsqrt(of.pow(2).mean(-1, keepdim=True) + self.o_norm_eps)
         return (of * self.o_norm_weight.float() * torch.sigmoid(gate.float())).to(
@@ -543,10 +577,13 @@ class OellmCKDA(MambaBase, nn.Module):
 
         t = x.shape[0]
         m = _layer_metadata(self.prefix)
-        q, k, v = self.q_proj(x)[0], self.k_proj(x)[0], self.v_proj(x)[0]
-        g = self.f_proj1(self.f_proj0(x)[0])[0]
-        beta = self.b_proj(x)[0]
-        gate_out = self._gate_out(x)
+        if decode_kernels.enabled() and x.is_cuda and self.tp == 1:
+            q, k, v, g, beta, gate_out = self._in_proj(x)
+        else:
+            q, k, v = self.q_proj(x)[0], self.k_proj(x)[0], self.v_proj(x)[0]
+            g = self.f_proj1(self.f_proj0(x)[0])[0]
+            beta = self.b_proj(x)[0]
+            gate_out = self._gate_out(x)
         if m is None:  # profile run
             o = v.view(t, self.nh, self.head_v_dim)
             return self.o_proj(self._o_norm(o, gate_out.view_as(o)).reshape(t, -1))[0]
@@ -642,6 +679,10 @@ class OellmCKDA(MambaBase, nn.Module):
 
 # ----------------------------------------------------------------------- MoE
 def _swiglu(gate, up, limit, norm=None):
+    if decode_kernels.enabled() and gate.is_cuda:
+        return decode_kernels.swiglu_post_act_norm(
+            gate.contiguous(), up.contiguous(), limit, norm
+        )
     if limit is not None:
         gate, up = gate.clamp(max=limit), up.clamp(min=-limit, max=limit)
     if norm is None:
@@ -784,6 +825,11 @@ class OellmMoE(nn.Module):
         return self._route_impl(gating_output, topk)
 
     def _route_impl(self, gating_output, topk):
+        if decode_kernels.enabled() and gating_output.is_cuda:
+            bias = self.qb_beta if self.quantile else self.e_score_correction_bias
+            return decode_kernels.sigmoid_topk_route(
+                gating_output, bias.float(), topk, self.scaling, self.quantile
+            )
         logits = gating_output.float()
         scores = torch.sigmoid(logits)
         if self.quantile:
@@ -845,7 +891,12 @@ class OellmMoE(nn.Module):
         param.data.copy_(loaded[self.first : self.first + self.local])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        logits = F.linear(x.float(), self.gate.float())
+        gate = self.gate
+        if decode_kernels.enabled() and gate.dtype != torch.float32:
+            if getattr(self, "_gate_f32", None) is None:
+                self._gate_f32 = gate.detach().float()
+            gate = self._gate_f32
+        logits = F.linear(x.float(), gate.float())
         if self.impl == "fused":
             out = self.experts(hidden_states=x, router_logits=logits)
         else:
@@ -1134,6 +1185,15 @@ class OellmEngram(MambaBase, nn.Module):
         return rows, signs, shifted[shifted.shape[0] - self.hist :]
 
     def _rows_decode(self, shifted: torch.Tensor, mult, sizes, offsets) -> torch.Tensor:
+        if decode_kernels.enabled() and shifted.is_cuda:
+            hid = id(mult)
+            hashes = self.__dict__.setdefault("_hash_kernels", {})
+            if hid not in hashes:
+                per = [n for n in self.orders for _ in range(self.num_heads)]
+                hashes[hid] = decode_kernels.EngramHash(
+                    per, mult, sizes, offsets, shifted.device
+                )
+            return hashes[hid](shifted)
         if _decode_graph_enabled():
             key = (tuple(tuple(row) for row in mult), tuple(sizes), tuple(offsets))
             return self.rows_graph(

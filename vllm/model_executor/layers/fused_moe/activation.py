@@ -210,13 +210,25 @@ def swiglu_post_act_norm(
     ``normed_swiglu``); a bf16 activation before the bound is a second rounding."""
     d = input.shape[-1] // 2
     gate, up = input[..., :d], input[..., d:]
+    from vllm.model_executor.layers import oellm_decode_kernels
+
+    if oellm_decode_kernels.enabled() and input.is_cuda and output.is_contiguous():
+        oellm_decode_kernels.swiglu_post_act_norm(
+            gate, up, clamp_limit, norm, out=output
+        )
+        return
     if clamp_limit is not None:
-        gate, up = gate.clamp(max=clamp_limit), up.clamp(min=-clamp_limit, max=clamp_limit)
+        gate, up = (
+            gate.clamp(max=clamp_limit),
+            up.clamp(min=-clamp_limit, max=clamp_limit),
+        )
     apply_post_act_norm(output, norm, act=F.silu(gate.float()) * up.float())
 
 
 def apply_post_act_norm(
-    output: torch.Tensor, norm: tuple[float, float, bool], act: torch.Tensor | None = None
+    output: torch.Tensor,
+    norm: tuple[float, float, bool],
+    act: torch.Tensor | None = None,
 ) -> None:
     """In place: the bounded RMS norm of each row (one routed token-expert pair) of
     ``act`` (default: ``output``)."""
