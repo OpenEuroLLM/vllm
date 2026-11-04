@@ -20,8 +20,15 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
-def enabled() -> bool:
-    return os.environ.get("OELLM_DECODE_KERNELS", "reference") == "triton"
+def enabled(name: str | None = None) -> bool:
+    """``OELLM_DECODE_KERNELS=triton``; ``OELLM_DECODE_KERNELS_OFF``: comma-separated
+    parts kept on the reference path (engram_hash, route, swiglu, ckda_proj,
+    o_norm, ckda_inplace, mhc_split, mhc_coeffs)."""
+    if os.environ.get("OELLM_DECODE_KERNELS", "reference") != "triton":
+        return False
+    return name is None or name not in os.environ.get(
+        "OELLM_DECODE_KERNELS_OFF", ""
+    ).split(",")
 
 
 # ---------------------------------------------------------------- Engram hashing

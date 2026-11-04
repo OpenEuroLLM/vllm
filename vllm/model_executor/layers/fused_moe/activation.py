@@ -212,7 +212,11 @@ def swiglu_post_act_norm(
     gate, up = input[..., :d], input[..., d:]
     from vllm.model_executor.layers import oellm_decode_kernels
 
-    if oellm_decode_kernels.enabled() and input.is_cuda and output.is_contiguous():
+    if (
+        oellm_decode_kernels.enabled("swiglu")
+        and input.is_cuda
+        and output.is_contiguous()
+    ):
         oellm_decode_kernels.swiglu_post_act_norm(
             gate, up, clamp_limit, norm, out=output
         )

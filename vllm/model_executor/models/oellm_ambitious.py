@@ -179,8 +179,9 @@ class OellmMHC(nn.Module):
         ):
             from vllm.model_executor.layers.oellm_fusion import mhc_read
 
-            fast = decode_kernels.enabled()
-            if fast and getattr(self, "_phi_t", None) is None:
+            split = decode_kernels.enabled("mhc_split")
+            coeffs = decode_kernels.enabled("mhc_coeffs")
+            if coeffs and getattr(self, "_phi_t", None) is None:
                 self._phi_t = self.phi.detach().t().to(streams.dtype).contiguous()
             return mhc_read(
                 streams,
@@ -193,8 +194,8 @@ class OellmMHC(nn.Module):
                 self.b_res,
                 self.eps,
                 self.iters,
-                split=fast,
-                phi_t=self._phi_t if fast else None,
+                split=split,
+                phi_t=self._phi_t if coeffs else None,
             )
         t, n, h = streams.shape
         flat = streams.reshape(t, n * h)
@@ -568,7 +569,7 @@ class OellmCKDA(MambaBase, nn.Module):
         )
 
     def _o_norm(self, o: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        if decode_kernels.enabled() and o.is_cuda:
+        if decode_kernels.enabled("o_norm") and o.is_cuda:
             return decode_kernels.rms_gate(o, gate, self.o_norm_weight, self.o_norm_eps)
         of = o.float()
         of = of * torch.rsqrt(of.pow(2).mean(-1, keepdim=True) + self.o_norm_eps)
@@ -582,7 +583,7 @@ class OellmCKDA(MambaBase, nn.Module):
 
         t = x.shape[0]
         m = _layer_metadata(self.prefix)
-        if decode_kernels.enabled() and x.is_cuda and self.tp == 1:
+        if decode_kernels.enabled("ckda_proj") and x.is_cuda and self.tp == 1:
             q, k, v, g, beta, gate_out = self._in_proj(x)
         else:
             q, k, v = self.q_proj(x)[0], self.k_proj(x)[0], self.v_proj(x)[0]
@@ -637,7 +638,7 @@ class OellmCKDA(MambaBase, nn.Module):
             if self.safe_gate:
                 g = g.clamp_min(self.lower_bound)
 
-        if not prefill and decode_kernels.enabled() and x.is_cuda:
+        if not prefill and decode_kernels.enabled("ckda_inplace") and x.is_cuda:
             # decode: the state read / written in place by slot, the sign gauge in the
             # kernel (FLA fused_recurrent_kda_fwd sign_decode; bit-exact to the
             # reference path below)
@@ -719,7 +720,7 @@ class OellmCKDA(MambaBase, nn.Module):
 
 # ----------------------------------------------------------------------- MoE
 def _swiglu(gate, up, limit, norm=None):
-    if decode_kernels.enabled() and gate.is_cuda:
+    if decode_kernels.enabled("swiglu") and gate.is_cuda:
         return decode_kernels.swiglu_post_act_norm(
             gate.contiguous(), up.contiguous(), limit, norm
         )
@@ -870,7 +871,7 @@ class OellmMoE(nn.Module):
         return self._route_impl(gating_output, topk)
 
     def _route_impl(self, gating_output, topk):
-        if decode_kernels.enabled() and gating_output.is_cuda:
+        if decode_kernels.enabled("route") and gating_output.is_cuda:
             bias = self.qb_beta if self.quantile else self.e_score_correction_bias
             return decode_kernels.sigmoid_topk_route(
                 gating_output, bias.float(), topk, self.scaling, self.quantile
@@ -1269,7 +1270,7 @@ class OellmEngram(MambaBase, nn.Module):
         return rows, signs, shifted[shifted.shape[0] - self.hist :]
 
     def _rows_decode(self, shifted: torch.Tensor, mult, sizes, offsets) -> torch.Tensor:
-        if decode_kernels.enabled() and shifted.is_cuda:
+        if decode_kernels.enabled("engram_hash") and shifted.is_cuda:
             hid = id(mult)
             hashes = self.__dict__.setdefault("_hash_kernels", {})
             if hid not in hashes:
