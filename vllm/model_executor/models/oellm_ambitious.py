@@ -179,6 +179,9 @@ class OellmMHC(nn.Module):
         ):
             from vllm.model_executor.layers.oellm_fusion import mhc_read
 
+            fast = decode_kernels.enabled()
+            if fast and getattr(self, "_phi_t", None) is None:
+                self._phi_t = self.phi.detach().t().to(streams.dtype).contiguous()
             return mhc_read(
                 streams,
                 self.phi,
@@ -190,6 +193,8 @@ class OellmMHC(nn.Module):
                 self.b_res,
                 self.eps,
                 self.iters,
+                split=fast,
+                phi_t=self._phi_t if fast else None,
             )
         t, n, h = streams.shape
         flat = streams.reshape(t, n * h)
@@ -632,6 +637,32 @@ class OellmCKDA(MambaBase, nn.Module):
             if self.safe_gate:
                 g = g.clamp_min(self.lower_bound)
 
+        if not prefill and decode_kernels.enabled() and x.is_cuda:
+            # decode: the state read / written in place by slot, the sign gauge in the
+            # kernel (FLA fused_recurrent_kda_fwd sign_decode; bit-exact to the
+            # reference path below)
+            from fla.ops.kda.fused_recurrent import fused_recurrent_kda_fwd
+
+            o, _ = fused_recurrent_kda_fwd(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                scale=self.head_dim**-0.5,
+                initial_state=rec_state,
+                inplace_final_state=True,
+                state_v_first=True,
+                cu_seqlens=self._decode_cu(n, x.device),
+                ssm_state_indices=idx[:n],
+                use_qk_l2norm_in_kernel=True,
+                use_gate_in_kernel=False,
+                use_beta_sigmoid_in_kernel=True,
+                allow_neg_eigval=self.allow_neg_eigval,
+                lower_bound=self.lower_bound,
+                sign_decode=None if sign is None else sign.contiguous(),
+            )
+            return self._finish(o, v, gate_out, n, t)
         if prefill:
             cu = m.non_spec_query_start_loc
             init = rec_state[idx].clone()
@@ -661,6 +692,15 @@ class OellmCKDA(MambaBase, nn.Module):
             **extra,
         )
         rec_state[idx[: final.shape[0]]] = final.to(rec_state.dtype)
+        return self._finish(o, v, gate_out, n, t)
+
+    def _decode_cu(self, n: int, device) -> torch.Tensor:
+        cache = self.__dict__.setdefault("_cu_cache", {})
+        if n not in cache:
+            cache[n] = torch.arange(n + 1, device=device, dtype=torch.long)
+        return cache[n]
+
+    def _finish(self, o, v, gate_out, n: int, t: int) -> torch.Tensor:
         if self.xsa:
             from fla.modules.xsa import exclusive_self_attention
 
@@ -752,6 +792,11 @@ class OellmMoE(nn.Module):
         self.register_buffer(bias_name, torch.zeros(e, dtype=torch.float32))
         self.fp8 = config.expert_weight_dtype == "fp8"
         self.block = int(config.expert_scale_block)
+        # OELLM_MOE_FP8=w8a16: the routed experts stay E4M3 on the GPU (half the bytes);
+        # the Triton MoE kernel dequantizes each tile to bf16 before its dot, as the
+        # loader does (bit-exact to the bf16 weights; checked at conversion)
+        self.fp8_w8a16 = self.fp8 and os.environ.get("OELLM_MOE_FP8", "") == "w8a16"
+        self._fp8_done = False
         self.impl = os.environ.get("OELLM_MOE", "fused")
         assert self.impl in ("fused", "naive"), self.impl
         self.local_expert_ids = None
@@ -858,6 +903,8 @@ class OellmMoE(nn.Module):
             if base not in pending or base + "_scale" not in pending:
                 return
             q, sc = pending.pop(base), pending.pop(base + "_scale")
+            if self.fp8_w8a16:  # the scales for the weight-only FP8 kernel (_to_fp8)
+                self.__dict__.setdefault("_fp8_scales", {})[base] = sc
             name, w = base, _Fp8Experts(q, sc, self.block)
         if self.impl == "naive":
             param = getattr(self, name)
@@ -890,7 +937,44 @@ class OellmMoE(nn.Module):
     def _expert_loader(self, param: torch.Tensor, loaded: torch.Tensor) -> None:
         param.data.copy_(loaded[self.first : self.first + self.local])
 
+    def _to_fp8(self) -> None:
+        """The loaded bf16 expert stacks -> E4M3 + the export's scales (local experts),
+        accepted only if they dequantize to exactly the loaded bf16 weights."""
+        from vllm.model_executor.layers.fused_moe.fused_moe import register_fp8_w8a16
+
+        self._fp8_done = True
+        scales = self.__dict__.pop("_fp8_scales", {})
+        params = dict(self.experts.named_parameters())
+        for name, suffix in (
+            ("gate_up_proj", "w13_weight"),
+            ("down_proj", "w2_weight"),
+        ):
+            ((_, param),) = [(n, p) for n, p in params.items() if n.endswith(suffix)]
+            w = param.data
+            e, rows, cols = w.shape
+            ids = (
+                sorted(self.local_expert_ids)
+                if self.local_expert_ids is not None
+                else list(range(self.num_experts))
+            )
+            sc = scales[name]
+            if len(ids) != e or w.dtype != torch.bfloat16 or cols % self.block:
+                raise ValueError(f"fp8 w8a16: unexpected expert stack {tuple(w.shape)}")
+            sc = sc[torch.tensor(ids)].to(w.device, torch.float32).contiguous()
+            groups = (e, rows, cols // self.block, self.block)
+            q = (w.float().view(groups) / sc[..., None]).to(torch.float8_e4m3fn)
+            back = (q.float() * sc[..., None]).view(w.shape).to(torch.bfloat16)
+            if not torch.equal(back, w):
+                raise ValueError(
+                    f"fp8 w8a16: {name} does not round-trip (expert placement?)"
+                )
+            del back
+            param.data = q.view(w.shape)
+            register_fp8_w8a16(param.data, sc, self.block)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.fp8_w8a16 and not self._fp8_done:
+            self._to_fp8()
         gate = self.gate
         if decode_kernels.enabled() and gate.dtype != torch.float32:
             if getattr(self, "_gate_f32", None) is None:

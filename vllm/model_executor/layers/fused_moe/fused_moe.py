@@ -351,6 +351,10 @@ def fused_moe_kernel(
     SWAP_AB: tl.constexpr,
     # Tensor-descriptor path for the A gather and B load in the K-loop.
     USE_TD: tl.constexpr = False,
+    # Weight-only FP8 (E4M3 B, fp32 scales per W8A16_GROUP_K elements of a B row): each
+    # tile is dequantized to compute_type before the dot (the bf16 weights' numerics).
+    use_fp8_w8a16: tl.constexpr = False,
+    W8A16_GROUP_K: tl.constexpr = 128,
 ):
     """Implements the fused computation for a Mixture of Experts (MOE) using
     token and expert matrices.
@@ -502,6 +506,8 @@ def fused_moe_kernel(
         else:
             a_scale = tl.load(a_scale_ptr)
             b_scale = tl.load(b_scale_ptr + off_experts)
+    if use_fp8_w8a16:
+        w8_scale_ptrs = b_scale_ptr + off_experts * stride_bse + offs_bn * stride_bsn
     if HAS_BIAS:
         # bias shape: [num_experts, N]
         bias_ptrs = b_bias_ptr + off_experts * stride_bbe + offs_bn * stride_bbn
@@ -558,6 +564,11 @@ def fused_moe_kernel(
                 else:
                     accumulator += tl.dot(a, b)
         else:
+            if use_fp8_w8a16:
+                w8_scale = tl.load(
+                    w8_scale_ptrs + ((k * BLOCK_SIZE_K) // W8A16_GROUP_K) * stride_bsk
+                )
+                b = (b.to(tl.float32) * w8_scale[None, :]).to(compute_type)
             accumulator += tl.dot(a, b)
         if not USE_TD:
             # Advance the ptrs to the next K block.
@@ -784,6 +795,14 @@ def invoke_fused_moe_triton_kernel(
     assert topk_weights is None or topk_weights.stride(1) == 1
     assert sorted_token_ids is None or sorted_token_ids.stride(0) == 1
 
+    fp8_w8a16 = B.dtype == torch.float8_e4m3fn and not (
+        use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16
+    )
+    w8a16_group = 128
+    if fp8_w8a16:
+        assert B_scale is None and A_scale is None
+        B_scale, w8a16_group = _FP8_W8A16[B.data_ptr()]
+
     if use_fp8_w8a8:
         SWAP_AB = enable_swap_ab(config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"])
     else:
@@ -813,7 +832,7 @@ def invoke_fused_moe_triton_kernel(
     elif use_int8_w8a16 or use_int4_w4a16:
         assert B_scale is not None
         assert block_shape is None or block_shape[0] == 0
-    else:
+    elif not fp8_w8a16:
         assert A_scale is None
         assert B_scale is None
 
@@ -842,6 +861,9 @@ def invoke_fused_moe_triton_kernel(
     BLOCK_SIZE_K = config.pop("BLOCK_SIZE_K")
     if block_shape is not None:
         BLOCK_SIZE_K = min(BLOCK_SIZE_K, min(block_shape[0], block_shape[1]))
+    if fp8_w8a16:  # a K tile stays within one scale group
+        BLOCK_SIZE_K = min(BLOCK_SIZE_K, w8a16_group)
+        assert w8a16_group % BLOCK_SIZE_K == 0
     if use_td and A.size(1) % BLOCK_SIZE_K != 0:
         # TD gather/load feeding tl.dot with a non-block-aligned K
         # miscompiles (~74% of output elements wrong) on real HW;
@@ -904,8 +926,21 @@ def invoke_fused_moe_triton_kernel(
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         SWAP_AB=SWAP_AB,
         USE_TD=use_td,
+        use_fp8_w8a16=fp8_w8a16,
+        W8A16_GROUP_K=w8a16_group,
         **config,
     )
+
+
+# Weight-only FP8 expert stacks (E4M3) -> (fp32 scales [E, N, K / group], group),
+# by the weight's data pointer (register_fp8_w8a16), looked up at the kernel launch.
+_FP8_W8A16: dict[int, tuple[torch.Tensor, int]] = {}
+
+
+def register_fp8_w8a16(weight: torch.Tensor, scale: torch.Tensor, group: int) -> None:
+    assert weight.dtype == torch.float8_e4m3fn and scale.dtype == torch.float32
+    assert scale.shape == (*weight.shape[:-1], weight.shape[-1] // group)
+    _FP8_W8A16[weight.data_ptr()] = (scale, group)
 
 
 def dispatch_fused_moe_kernel(
