@@ -971,8 +971,11 @@ class OellmEngram(MambaBase, nn.Module):
         # page cache, shared by the node's ranks), "ram" (the same, read once at load:
         # resident),
         # "gpu" (rows sharded over the TP ranks in GPU memory, an all-reduce per lookup)
+        # "uva": a node-shared pinned host copy read by a GPU gather kernel (no host
+        # sync: CUDA-graph capturable, see oellm_uva_table)
         self.table_mode = os.environ.get("OELLM_ENGRAM_TABLES", "mmap")
-        assert self.table_mode in ("mmap", "ram", "gpu"), self.table_mode
+        assert self.table_mode in ("mmap", "ram", "gpu", "uva"), self.table_mode
+        self.uva_table: Any = None
         self.model_dir = os.environ.get(
             "OELLM_ENGRAM_MODEL_DIR", vllm_config.model_config.model
         )
@@ -1057,6 +1060,15 @@ class OellmEngram(MambaBase, nn.Module):
         """Table rows ``[..., L]`` -> ``[..., L, dim]``."""
         if self.table_mode == "gpu":
             return self.table(rows)
+        if self.table_mode == "uva":
+            if self.uva_table is None:
+                from vllm.model_executor.layers.oellm_uva_table import UvaTable
+
+                src = _safetensors_memmap(self.model_dir, f"{self.prefix}.table")
+                self.uva_table = UvaTable(
+                    src, f"{os.path.realpath(self.model_dir)}:{self.prefix}"
+                )
+            return self.uva_table(rows)
         group = get_tp_group()
         if self.lookup_mode == "leader" and group.world_size > 1:
             if group.rank_in_group == 0:
