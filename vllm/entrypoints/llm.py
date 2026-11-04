@@ -60,6 +60,33 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _oellm_env_compilation_config(model: str) -> dict[str, Any] | None:
+    """``OELLM_VLLM_CUDAGRAPH=full_decode``: vLLM's FULL_DECODE_ONLY CUDA graphs without
+    torch.compile (experiment 012) for engines whose caller passes no compilation
+    config -- lm-eval, evalchemy and lighteval build ``LLM`` themselves -- and only
+    for local exports of the model types in ``OELLM_VLLM_CUDAGRAPH_MODELS`` (default
+    ``oellm_ambitious``); such an engine also runs with ``enforce_eager=False``."""
+    import json
+    import os
+
+    mode = os.environ.get("OELLM_VLLM_CUDAGRAPH", "").strip()
+    if mode in ("", "none"):
+        return None
+    if mode != "full_decode":
+        raise ValueError(f"Unknown OELLM_VLLM_CUDAGRAPH: {mode}")
+    models = os.environ.get("OELLM_VLLM_CUDAGRAPH_MODELS", "oellm_ambitious")
+    try:
+        with open(os.path.join(str(model), "config.json")) as f:
+            model_type = json.load(f).get("model_type")
+    except (OSError, ValueError):
+        return None
+    if model_type not in models.split(","):
+        return None
+    config = {"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"}
+    logger.info("OELLM_VLLM_CUDAGRAPH for %s (%s): %s", model, model_type, config)
+    return config
+
+
 class LLM(
     BeamSearchOfflineMixin, PoolingOfflineMixin, RLOfflineMixin, OfflineInferenceMixin
 ):
@@ -263,6 +290,10 @@ class LLM(
                 return cls(**{k: v for k, v in value.items() if is_init_field(cls, k)})  # type: ignore[arg-type]
             return value
 
+        if compilation_config is None:
+            env_config = _oellm_env_compilation_config(model)
+            if env_config is not None:
+                compilation_config, enforce_eager = env_config, False
         if isinstance(compilation_config, int):
             compilation_config_instance = CompilationConfig(
                 mode=CompilationMode(compilation_config)
