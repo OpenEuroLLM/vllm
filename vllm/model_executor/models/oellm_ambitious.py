@@ -644,12 +644,14 @@ class OellmCKDA(MambaBase, nn.Module):
             # reference path below)
             from fla.ops.kda.fused_recurrent import fused_recurrent_kda_fwd
 
+            # the kernel indexes its inputs as contiguous (the public FLA op's
+            # input_guard does this; beta / g can be strided slices of merged GEMMs)
             o, _ = fused_recurrent_kda_fwd(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
+                q=q.contiguous(),
+                k=k.contiguous(),
+                v=v.contiguous(),
+                g=g.contiguous(),
+                beta=beta.contiguous(),
                 scale=self.head_dim**-0.5,
                 initial_state=rec_state,
                 inplace_final_state=True,
