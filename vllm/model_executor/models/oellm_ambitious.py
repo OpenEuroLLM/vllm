@@ -746,10 +746,33 @@ class _Fp8Experts:
     block]), indexed like the bf16 stack: [e] / [e, a:b] dequantize that slice to
     bf16."""
 
-    def __init__(self, q: torch.Tensor, scale: torch.Tensor, block: int) -> None:
+    def __init__(
+        self,
+        q: torch.Tensor,
+        scale: torch.Tensor,
+        block: int,
+        device: torch.device | None = None,
+        experts: list[int] | None = None,
+    ) -> None:
+        # ``experts`` (this rank's, under EP) and ``device``: only those experts' bytes
+        # and scales, moved once, so the slices dequantize on the GPU. On the CPU, one
+        # expert at a time, the dequantization made most of a 13 min engine start.
+        self.pos = None
+        if experts is not None:
+            sel = torch.tensor(experts, dtype=torch.long)
+            q, scale = q.index_select(0, sel), scale.index_select(0, sel)
+            self.pos = {e: i for i, e in enumerate(experts)}
+        if device is not None:
+            q, scale = q.to(device), scale.to(device)
         self.q, self.scale, self.block = q, scale, block
 
     def __getitem__(self, idx) -> torch.Tensor:
+        if self.pos is not None:  # global expert id -> row of the selected experts
+            idx = (
+                (self.pos[idx[0]], *idx[1:])
+                if isinstance(idx, tuple)
+                else self.pos[idx]
+            )
         q = self.q[idx].view(torch.float8_e4m3fn).float()
         s = self.scale[idx].float()
         return (
@@ -908,7 +931,17 @@ class OellmMoE(nn.Module):
             q, sc = pending.pop(base), pending.pop(base + "_scale")
             if self.fp8_w8a16:  # the scales for the weight-only FP8 kernel (_to_fp8)
                 self.__dict__.setdefault("_fp8_scales", {})[base] = sc
-            name, w = base, _Fp8Experts(q, sc, self.block)
+            if self.impl == "naive":
+                w = _Fp8Experts(q, sc, self.block)
+            else:  # this rank's experts, dequantized on the GPU of the FusedMoE weights
+                dev = next(self.experts.parameters()).device
+                local = (
+                    sorted(self.local_expert_ids)
+                    if self.local_expert_ids is not None
+                    else None
+                )
+                w = _Fp8Experts(q, sc, self.block, device=dev, experts=local)
+            name = base
         if self.impl == "naive":
             param = getattr(self, name)
             param.data.copy_(w[self.first : self.first + self.local])
