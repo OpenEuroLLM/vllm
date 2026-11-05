@@ -1154,6 +1154,20 @@ def safetensors_weights_iterator(
             avail_bytes / 1024**3,
         )
 
+    # OpenEuroLLM: on GPFS the whole checkpoint is read into the page cache
+    # first, in parallel byte ranges and once per node (oellm_prefetch: ~14 GB/s
+    # on MareNostrum 5, vs ~80 MB/s for the mmap reads of the FP8 expert
+    # shards); vLLM's per-file prefetch is then not needed.
+    from vllm.model_executor.model_loader import oellm_prefetch
+
+    if (
+        safetensors_load_strategy in (None, "prefetch")
+        and fits_in_ram
+        and oellm_prefetch.enabled(fs_type)
+    ):
+        oellm_prefetch.prefetch_checkpoint_parallel(sorted_files)
+        should_prefetch = False
+
     if should_prefetch:
         _prefetch_all_checkpoints(
             sorted_files,
