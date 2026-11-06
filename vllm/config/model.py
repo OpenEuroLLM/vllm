@@ -807,6 +807,16 @@ class ModelConfig:
             self.disable_sliding_window = True
             self.hf_text_config.sliding_window = None
 
+        # OpenEuroLLM: the oellm_ambitious exports declare a context window far
+        # beyond any KV cache (no position embeddings, max_position_embeddings 100M).
+        # Without an explicit max_model_len such a model auto-fits it to the KV cache
+        # memory (-1) instead of failing the "one request of max seq len must fit"
+        # check at startup.
+        if (
+            self.max_model_len is None
+            and getattr(self.hf_config, "model_type", None) == "oellm_ambitious"
+        ):
+            self.max_model_len = -1
         self.original_max_model_len = self.max_model_len
         self.max_model_len = self.get_and_verify_max_len(self.max_model_len)
 
