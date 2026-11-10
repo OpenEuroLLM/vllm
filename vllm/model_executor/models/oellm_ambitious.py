@@ -376,6 +376,10 @@ class OellmXSAAttention(nn.Module):
             cache_config=vllm_config.cache_config,
             prefix=f"{prefix}.attn",
         )
+        # a kvshare source (OellmAmbitiousModel sets keep_v): the step's values, for the
+        # kvshare layers' XSA (their keys / values come from this layer's KV cache)
+        self.keep_v = False
+        self.last_v: torch.Tensor | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         t = x.shape[0]
@@ -383,6 +387,8 @@ class OellmXSAAttention(nn.Module):
         q, k, v = qkv.split(
             [self.nh * self.d, self.nkv * self.d, self.nkv * self.d], dim=-1
         )
+        if self.keep_v:
+            self.last_v = v
         if self.q_norm is not None:
             assert self.k_norm is not None
             q = self.q_norm(q.view(t, self.nh, self.d)).view(t, -1)
@@ -392,6 +398,87 @@ class OellmXSAAttention(nn.Module):
         if self.gate_proj is not None:
             gate = torch.sigmoid(self.gate_proj(x)[0].view(t, self.nh, self.d).float())
         if self.xsa:
+            vf = v.view(t, self.nkv, self.d).float()
+            if self.rep > 1:
+                vf = vf.repeat_interleave(self.rep, dim=1)
+            of = o.float()
+            c = (of * vf).sum(-1, keepdim=True) / (
+                vf.pow(2).sum(-1, keepdim=True) + self.xsa_eps
+            )
+            of = of - c * vf
+            if gate is not None:
+                of = of * gate
+            o = of.to(x.dtype)
+        elif gate is not None:
+            o = (o.float() * gate).to(x.dtype)
+        out, _ = self.o_proj(o.reshape(t, self.nh * self.d))
+        return out
+
+
+class OellmKVShareAttention(nn.Module):
+    """A ckda_branch kvshare attention past its hand-over (the export's ``kvshare``
+    blocks): q (+ sigmoid output gate), q-norm and ``o_proj`` of its own; the keys /
+    values are the source attention layer's (``kv_share_sources``), read from its KV
+    cache (``kv_sharing_target_layer_name``: no cache of its own), XSA against the
+    source's value of each token (the source's ``last_v`` of this step)."""
+
+    def __init__(
+        self, config, vllm_config: VllmConfig, prefix: str, source_prefix: str
+    ) -> None:
+        super().__init__()
+        tp, _ = _tp()
+        h, d = config.hidden_size, config.head_dim
+        self.total_heads, self.total_kv = (
+            config.num_attention_heads,
+            config.num_key_value_heads,
+        )
+        assert self.total_heads % tp == 0
+        self.nh = self.total_heads // tp
+        self.nkv = max(1, self.total_kv // tp)
+        self.d = d
+        self.rep = self.nh // self.nkv
+        self.xsa, self.xsa_eps = config.exclusive_self_attention, config.xsa_eps
+        self.q_proj = ColumnParallelLinear(
+            h, self.total_heads * d, bias=False, prefix=f"{prefix}.q_proj"
+        )
+        self.gate_proj = (
+            ColumnParallelLinear(
+                h, self.total_heads * d, bias=False, prefix=f"{prefix}.gate_proj"
+            )
+            if config.attention_output_gate
+            else None
+        )
+        self.o_proj = RowParallelLinear(
+            self.total_heads * d, h, bias=False, prefix=f"{prefix}.o_proj"
+        )
+        zcg = config.layernorm_zero_centered_gamma
+        self.q_norm = (
+            OellmRMSNorm(d, config.rms_norm_eps, zcg) if config.qk_layernorm else None
+        )
+        self.attn = Attention(
+            self.nh,
+            d,
+            d**-0.5,
+            num_kv_heads=self.nkv,
+            cache_config=vllm_config.cache_config,
+            prefix=f"{prefix}.attn",
+            kv_sharing_target_layer_name=f"{source_prefix}.attn",
+        )
+        # the source OellmXSAAttention (set by the model; not a submodule)
+        self._source: list[OellmXSAAttention] = []
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        t = x.shape[0]
+        q, _ = self.q_proj(x)
+        if self.q_norm is not None:
+            q = self.q_norm(q.view(t, self.nh, self.d)).view(t, -1)
+        o = self.attn(q, None, None).view(t, self.nh, self.d)
+        gate = None
+        if self.gate_proj is not None:
+            gate = torch.sigmoid(self.gate_proj(x)[0].view(t, self.nh, self.d).float())
+        if self.xsa:
+            v = self._source[0].last_v
+            assert v is not None and v.shape[0] == t, "kvshare: the source's values"
             vf = v.view(t, self.nkv, self.d).float()
             if self.rep > 1:
                 vf = vf.repeat_interleave(self.rep, dim=1)
@@ -1740,6 +1827,14 @@ class OellmAmbitiousLayer(nn.Module):
             )
         if self.kind == "attention":
             self.mixer = OellmXSAAttention(config, vllm_config, f"{prefix}.mixer")
+        elif self.kind == "kvshare":
+            src = int(config.kv_share_sources[str(layer_idx)])
+            self.mixer = OellmKVShareAttention(
+                config,
+                vllm_config,
+                f"{prefix}.mixer",
+                f"{prefix.rsplit('.', 1)[0]}.{src}.mixer",
+            )
         elif self.kind == "ckda":
             self.mixer = OellmCKDA(config, vllm_config, f"{prefix}.mixer")
         elif self.kind == "kronlstm":
@@ -1854,6 +1949,12 @@ class OellmAmbitiousModel(nn.Module):
             OellmAmbitiousLayer(config, i, vllm_config, f"{prefix}.layers.{i}")
             for i in range(config.num_hidden_layers)
         )
+        # kvshare layers read their source attention layer's values of the step (XSA)
+        for i, src in (config.kv_share_sources or {}).items():
+            source = self.layers[int(src)].mixer
+            assert isinstance(source, OellmXSAAttention) and int(src) < int(i)
+            source.keep_v = True
+            self.layers[int(i)].mixer._source.append(source)
         self.norm = OellmRMSNorm(
             config.hidden_size,
             config.rms_norm_eps,
@@ -1914,9 +2015,10 @@ class OellmAmbitiousModel(nn.Module):
 # Fields later exports added, with the defaults of the export's config class: an older
 # export's
 # bundled configuration file does not define them.
-_CONFIG_DEFAULTS = {
+_CONFIG_DEFAULTS: dict[str, Any] = {
     "residual": "mhc",
     "fla_layer_kronlstm": None,
+    "kv_share_sources": {},
     "ldm_groups": 16,
     "ldm_key_dim": 8,
     "ldm_hidden_dim": 32,
