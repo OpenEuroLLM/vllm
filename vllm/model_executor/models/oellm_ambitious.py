@@ -720,6 +720,283 @@ class OellmCKDA(MambaBase, nn.Module):
         return out
 
 
+# ----------------------------------------------------------------------- KronLSTM
+class OellmKronLSTM(MambaBase, nn.Module):
+    """FLA ``KronLSTM`` (``fla.layers.kronlstm``) on the FLA kernels: a ckda_branch
+    KronLSTM past its hand-over (Megatron megatron/core/ssm/ckda_branch.py; the HF
+    export's ``kronlstm`` blocks), heads sharded over the TP ranks. Same state slots
+    as the CKDA layers (state [H, K, V] fp32 with K = V, conv state over q | k | v);
+    the export's ``qkv_proj`` / ``qkv_conv1d`` load into q / k / v.
+
+    One step: y = k^T Diag(f) S v, the write s (c - beta y) with decouple_erase
+    (s = 2 under allow_neg_eigval), S' = Diag(f) S + u k v^T, o = scale q^T S';
+    q, k (and v with normalize_v) L2-normalized per head, the signed gate's sign
+    as a gauge on q / k (the kernels return the un-gauged state, so the cached
+    state continues exactly across calls)."""
+
+    def __init__(self, config, vllm_config: VllmConfig, prefix: str) -> None:
+        super().__init__()
+        from fla.layers.complex_kda_layer import is_signed
+
+        kw = dict(config.fla_layer_kronlstm["kwargs"])
+        unsupported = [k for k in ("forget_angle", "erase_angle") if kw.get(k)]
+        if unsupported:
+            raise NotImplementedError(f"KronLSTM {unsupported} is not ported")
+        if kw.get("decay_gate", "vector") != "vector":
+            raise NotImplementedError("KronLSTM decay_gate='scalar' is not ported")
+        self.tp, self.tp_rank = _tp()
+        h = config.hidden_size
+        self.head_dim = kw.get("k_head_dim", 128)
+        self.head_v_dim = kw.get("v_head_dim", self.head_dim)
+        self.num_heads = kw.get("num_k_heads", 16)
+        assert kw.get("num_v_heads", self.num_heads) == self.num_heads
+        assert self.num_heads % self.tp == 0 and self.head_v_dim == self.head_dim
+        ckda = (
+            dict(config.fla_layer["kwargs"])
+            if getattr(config, "fla_layer", None)
+            else {}
+        )
+        # the shared mamba state slots are shaped from the CKDA layers' kwargs
+        assert (
+            ckda.get("num_heads", self.num_heads),
+            ckda.get("head_dim", self.head_dim),
+            ckda.get("conv_size", 4),
+        ) == (self.num_heads, self.head_dim, kw.get("conv_size", 4)), (
+            "KronLSTM and CKDA layers must share the state shape"
+        )
+        self.nh = self.num_heads // self.tp
+        self.key_dim = self.value_dim = self.num_heads * self.head_dim
+        self.lk = self.lv = self.key_dim // self.tp
+        self.gate = kw.get("gate", "softplus")
+        self.signed = is_signed(self.gate)
+        self.lower_bound = kw.get("lower_bound", -5.0)
+        self.forget_offset = float(kw.get("forget_offset", 0.0))
+        self.allow_neg_eigval = bool(kw.get("allow_neg_eigval", False)) and kw.get(
+            "use_beta", True
+        )
+        self.normalize_v = kw.get("normalize_v", True)
+        self.use_target_gate = kw.get("use_target_gate", True)
+        self.decouple_erase = kw.get("decouple_erase", True)
+        self.signed_write = kw.get("signed_write", False)
+        self.unit_write = (
+            kw.get("unit_write", False)
+            and self.allow_neg_eigval
+            and self.use_target_gate
+        )
+        self.conv_size = kw.get("conv_size", 4)
+        assert kw.get("use_short_conv", True) and not kw.get("conv_bias", False)
+        act = None if kw.get("drop_silu", False) else "silu"
+        self.conv_act = {c: act for c in "qkv"}
+        self.output_gate = kw.get("output_gate_rank", "full")
+        assert kw.get("use_output_gate", True), (
+            "KronLSTM without the output gate is not ported"
+        )
+
+        self.q_proj = ColumnParallelLinear(
+            h, self.key_dim, bias=False, prefix=f"{prefix}.q_proj"
+        )
+        self.k_proj = ColumnParallelLinear(
+            h, self.key_dim, bias=False, prefix=f"{prefix}.k_proj"
+        )
+        self.v_proj = ColumnParallelLinear(
+            h, self.value_dim, bias=False, prefix=f"{prefix}.v_proj"
+        )
+        for name, dim in (
+            ("q", self.key_dim),
+            ("k", self.key_dim),
+            ("v", self.value_dim),
+        ):
+            conv = ColumnParallelLinear(
+                self.conv_size, dim, bias=False, prefix=f"{prefix}.{name}_conv1d"
+            )
+            conv.weight.data = conv.weight.data.unsqueeze(1)  # [dim, 1, K] as nn.Conv1d
+            setattr(self, f"{name}_conv1d", conv)
+        self.b_proj = ColumnParallelLinear(
+            h,
+            self.num_heads,
+            bias=bool(kw.get("neg_eigval_init_bias")) and self.allow_neg_eigval,
+            prefix=f"{prefix}.b_proj",
+        )
+        if self.use_target_gate:
+            self.c_proj = ColumnParallelLinear(
+                h, self.num_heads, bias=self.signed_write, prefix=f"{prefix}.c_proj"
+            )
+        self.f_proj0 = ReplicatedLinear(
+            h, self.head_v_dim, bias=False, prefix=f"{prefix}.f_proj.0"
+        )
+        self.f_proj1 = ColumnParallelLinear(
+            self.head_v_dim, self.key_dim, bias=False, prefix=f"{prefix}.f_proj.1"
+        )
+        self.A_log = nn.Parameter(torch.zeros(self.nh, dtype=torch.float32))
+        self.dt_bias = nn.Parameter(
+            torch.zeros(self.nh * self.head_dim, dtype=torch.float32)
+        )
+        self.A_log.weight_loader = _tp_shard_loader
+        self.dt_bias.weight_loader = _tp_shard_loader
+        if self.output_gate == "lowrank":
+            self.g_proj0 = ReplicatedLinear(
+                h, self.head_v_dim, bias=False, prefix=f"{prefix}.g_proj.0"
+            )
+            self.g_proj1 = ColumnParallelLinear(
+                self.head_v_dim, self.value_dim, bias=True, prefix=f"{prefix}.g_proj.1"
+            )
+        else:
+            self.g_proj = ColumnParallelLinear(
+                h, self.value_dim, bias=True, prefix=f"{prefix}.g_proj"
+            )
+        self.o_norm_weight = nn.Parameter(torch.ones(self.head_v_dim))
+        self.o_norm_eps = kw.get("norm_eps", 1e-5)
+        self.o_proj = RowParallelLinear(
+            self.value_dim, h, bias=False, prefix=f"{prefix}.o_proj"
+        )
+
+        self.model_config = vllm_config.model_config
+        self.cache_config = vllm_config.cache_config
+        self.prefix = prefix
+        self.kv_cache = (torch.tensor([]), torch.tensor([]))
+        _register(prefix, self)
+
+    # -- mamba state (the CKDA layers' layout and size)
+    @property
+    def mamba_type(self) -> MambaAttentionBackendEnum:
+        return MambaAttentionBackendEnum.GDN_ATTN
+
+    def get_state_dtype(self):
+        return MambaStateDtypeCalculator.kda_state_dtype(
+            self.model_config.dtype, self.cache_config.mamba_cache_dtype, "float32"
+        )
+
+    def get_state_shape(self):
+        return MambaStateShapeCalculator.kda_state_shape(
+            self.tp, self.num_heads, self.head_dim, conv_kernel_size=self.conv_size
+        )
+
+    def _gate_out(self, x: torch.Tensor) -> torch.Tensor:
+        if self.output_gate == "lowrank":
+            return self.g_proj1(self.g_proj0(x)[0])[0]
+        return self.g_proj(x)[0]
+
+    def _o_norm(self, o: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        of = o.float()
+        of = of * torch.rsqrt(of.pow(2).mean(-1, keepdim=True) + self.o_norm_eps)
+        return (of * self.o_norm_weight.float() * torch.sigmoid(gate.float())).to(
+            o.dtype
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from fla.layers.complex_kda_layer import compute_gate
+        from fla.ops.kronlstm import chunk_kronlstm, fused_recurrent_kronlstm
+
+        t = x.shape[0]
+        m = _layer_metadata(self.prefix)
+        q, k, v = self.q_proj(x)[0], self.k_proj(x)[0], self.v_proj(x)[0]
+        z = self.f_proj1(self.f_proj0(x)[0])[0]
+        beta_logit = self.b_proj(x)[0]
+        c_logit = self.c_proj(x)[0] if self.use_target_gate else None
+        gate_out = self._gate_out(x)
+        if m is None:  # profile run
+            o = v.view(t, self.nh, self.head_v_dim)
+            return self.o_proj(self._o_norm(o, gate_out.view_as(o)).reshape(t, -1))[0]
+
+        n = m.num_actual_tokens
+        q, k, v, z, beta_logit, gate_out = (
+            y[:n] for y in (q, k, v, z, beta_logit, gate_out)
+        )
+        if c_logit is not None:
+            c_logit = c_logit[:n]
+        conv_state, rec_state = self.kv_cache
+        if not is_conv_state_dim_first():
+            conv_state = conv_state.transpose(-1, -2)
+        cs = dict(zip("qkv", conv_state.split([self.lk, self.lk, self.lv], dim=-2)))
+        idx = m.non_spec_state_indices_tensor
+        assert m.spec_sequence_masks is None, "speculative decoding is not supported"
+        prefill = m.num_prefills > 0
+        outs = []
+        for name, y in (("q", q), ("k", k), ("v", v)):
+            w = getattr(self, f"{name}_conv1d").weight
+            w = w.view(w.size(0), w.size(2))
+            if prefill:
+                y = causal_conv1d_fn(
+                    y.transpose(0, 1),
+                    w,
+                    None,
+                    conv_states=cs[name],
+                    query_start_loc=m.non_spec_query_start_loc,
+                    cache_indices=idx,
+                    has_initial_state=m.has_initial_state,
+                    activation=self.conv_act[name],
+                    metadata=m,
+                ).transpose(0, 1)
+            else:
+                y = causal_conv1d_update(
+                    y.contiguous(),
+                    cs[name],
+                    w,
+                    None,
+                    activation=self.conv_act[name],
+                    conv_state_indices=idx[:n],
+                )
+            outs.append(y)
+        q, k, v = (y.reshape(1, n, self.nh, -1) for y in outs)
+        # as fla.layers.kronlstm: the norms back in the projection dtype, gates in fp32
+        q, k = (F.normalize(y, dim=-1).to(y.dtype) for y in (q, k))
+        if self.normalize_v:
+            v = F.normalize(v, dim=-1).to(v.dtype)
+        beta = beta_logit.reshape(1, n, self.nh).sigmoid()
+        z = z.reshape(1, n, self.nh, self.head_dim)
+        sign = None
+        if self.gate != "softplus":
+            sign, g = compute_gate(
+                self.gate, z, self.A_log, self.dt_bias, self.lower_bound
+            )
+        else:
+            g = torch.nn.functional.softplus(
+                z.float() + self.dt_bias.view(self.nh, self.head_dim)
+            )
+            g = -self.A_log.float().exp().unsqueeze(-1) * g
+        if self.forget_offset:
+            g = g - self.forget_offset
+        target_gate = None
+        if c_logit is not None:
+            target_gate = c_logit.reshape(1, n, self.nh).float().sigmoid()
+            if self.signed_write:
+                target_gate = 2.0 * target_gate - 1.0
+            if self.unit_write:
+                target_gate = target_gate * 0.5
+        if prefill:
+            cu = m.non_spec_query_start_loc
+            init = rec_state[idx].clone()
+            init[~m.has_initial_state] = 0
+            kernel = chunk_kronlstm
+        else:
+            cu = torch.arange(n + 1, device=x.device, dtype=torch.int32)
+            init = rec_state[idx[:n]].clone()
+            kernel = fused_recurrent_kronlstm
+        o, final = kernel(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=init.float(),
+            output_final_state=True,
+            allow_neg_eigval=self.allow_neg_eigval,
+            target_gate=target_gate,
+            decouple_erase=self.decouple_erase,
+            cu_seqlens=cu.long(),
+            sign=sign,
+        )
+        rec_state[idx[: final.shape[0]]] = final.to(rec_state.dtype)
+        o = self._o_norm(
+            o.reshape(n, self.nh, self.head_v_dim).to(x.dtype),
+            gate_out.view(n, self.nh, self.head_v_dim),
+        )
+        out = self.o_proj(o.reshape(n, -1))[0]
+        if n < t:
+            out = torch.cat([out, out.new_zeros(t - n, out.shape[-1])])
+        return out
+
+
 # ----------------------------------------------------------------------- MoE
 def _swiglu(gate, up, limit, norm=None):
     if decode_kernels.enabled("swiglu") and gate.is_cuda:
@@ -1465,6 +1742,8 @@ class OellmAmbitiousLayer(nn.Module):
             self.mixer = OellmXSAAttention(config, vllm_config, f"{prefix}.mixer")
         elif self.kind == "ckda":
             self.mixer = OellmCKDA(config, vllm_config, f"{prefix}.mixer")
+        elif self.kind == "kronlstm":
+            self.mixer = OellmKronLSTM(config, vllm_config, f"{prefix}.mixer")
         elif self.kind == "moe":
             self.mixer = OellmMoE(config, f"{prefix}.mixer")
         else:
@@ -1517,7 +1796,7 @@ class OellmAmbitiousLayer(nn.Module):
                     tuple(t.data_ptr() for t in self.mixer.kv_cache),
                 )
                 return self.ckda_graph(call, streams, idx, key=key)
-        if graph and self.kind not in ("ckda", "engram"):
+        if graph and self.kind not in ("ckda", "engram", "kronlstm"):
             x, post, res = self.pre_graph(self._mhc_pre, streams)
             out = self.mixer(x)
             return self.post_graph(self._mhc_post, streams, out, post, res)
@@ -1637,6 +1916,7 @@ class OellmAmbitiousModel(nn.Module):
 # bundled configuration file does not define them.
 _CONFIG_DEFAULTS = {
     "residual": "mhc",
+    "fla_layer_kronlstm": None,
     "ldm_groups": 16,
     "ldm_key_dim": 8,
     "ldm_hidden_dim": 32,
@@ -1728,6 +2008,20 @@ class OellmAmbitiousForCausalLM(nn.Module, HasInnerState, IsHybrid):
                     n for n in params if n.startswith(mod + ".experts.") or n == target
                 )
                 continue
+            if (
+                shard == "split_qkv"
+            ):  # KronLSTM's [q; k; v] projection / conv -> its q / k / v modules
+                head = target.rsplit(".", 2)[0]  # <layer>.mixer
+                kind_name = "conv1d" if "conv1d" in target else "proj"
+                assert w.shape[0] % 3 == 0, f"{name}: q | k | v of equal width expected"
+                for part, piece in zip("qkv", torch.split(w, w.shape[0] // 3, dim=0)):
+                    pn = f"{head}.{part}_{kind_name}.weight"
+                    p = params[pn]
+                    getattr(p, "weight_loader", default_weight_loader)(
+                        p, piece.contiguous()
+                    )
+                    loaded.add(pn)
+                continue
             if shard == "host_table":
                 if (
                     target not in params
@@ -1765,6 +2059,18 @@ class OellmAmbitiousForCausalLM(nn.Module, HasInnerState, IsHybrid):
                         return pre + "qkv_proj.weight", sh
             elif kind == "ckda":
                 tail = tail.removeprefix("layer.")
+                tail = {
+                    "f_proj.0.weight": "f_proj0.weight",
+                    "f_proj.1.weight": "f_proj1.weight",
+                    "g_proj.0.weight": "g_proj0.weight",
+                    "g_proj.1.weight": "g_proj1.weight",
+                    "g_proj.1.bias": "g_proj1.bias",
+                    "o_norm.weight": "o_norm_weight",
+                }.get(tail, tail)
+            elif kind == "kronlstm":
+                tail = tail.removeprefix("layer.")
+                if tail in ("qkv_proj.weight", "qkv_conv1d.weight"):
+                    return pre + tail, "split_qkv"
                 tail = {
                     "f_proj.0.weight": "f_proj0.weight",
                     "f_proj.1.weight": "f_proj1.weight",
