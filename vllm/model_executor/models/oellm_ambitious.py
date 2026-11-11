@@ -1608,6 +1608,11 @@ class OellmEngram(MambaBase, nn.Module):
         # OELLM_ENGRAM_OUT_SCALE: multiplies the Engram layer's output (diagnostic:
         # how much the hashed n-gram path drives a behaviour; 1 = as trained)
         self.out_scale = float(os.environ.get("OELLM_ENGRAM_OUT_SCALE", "1"))
+        # OELLM_ENGRAM_SCALE_LAYERS: comma list of the Engram layer indices the scale
+        # applies to (default: every Engram layer)
+        only = os.environ.get("OELLM_ENGRAM_SCALE_LAYERS", "").strip()
+        if only and layer_idx not in {int(x) for x in only.split(",")}:
+            self.out_scale = 1.0
         self.conv_norm = (
             OellmRMSNorm(h, config.rms_norm_eps) if config.engram_conv_prenorm else None
         )
