@@ -530,6 +530,19 @@ class OellmCKDA(MambaBase, nn.Module):
         self.lower_bound = kw.get("lower_bound", -5.0)
         self.forget_offset = float(kw.get("forget_offset", 0.0))
         self.allow_neg_eigval = kw.get("allow_neg_eigval", False)
+        # recall-surgery diagnostics (default off): OELLM_CKDA_BETA_CAP1 caps beta
+        # at 1 (logits <= 0 under allow_neg_eigval), OELLM_CKDA_NO_SIGN drops the
+        # signed-decay gauge (no negative / rotating eigenvalues), both from layer
+        # OELLM_CKDA_DIAG_FROM_LAYER on (the first CKDA layers can stay untouched)
+        parts = prefix.split(".")
+        layer_no = next(
+            (int(b) for a, b in zip(parts, parts[1:]) if a == "layers" and b.isdigit()),
+            None,
+        )
+        first = int(os.environ.get("OELLM_CKDA_DIAG_FROM_LAYER", "0"))
+        diag_on = layer_no is not None and layer_no >= first
+        self.diag_beta_cap1 = diag_on and os.environ.get("OELLM_CKDA_BETA_CAP1") == "1"
+        self.diag_no_sign = diag_on and os.environ.get("OELLM_CKDA_NO_SIGN") == "1"
         self.conv_size = kw.get("conv_size", 4)
         assert kw.get("use_short_conv", True) and not kw.get("conv_bias", False)
         drop_silu = kw.get("drop_silu", False)
@@ -720,6 +733,10 @@ class OellmCKDA(MambaBase, nn.Module):
         g = g.reshape(1, n, self.nh, self.head_dim)
         beta = beta.reshape(1, n, self.nh)
         sign, g = compute_gate(self.gate, g, self.A_log, self.dt_bias, self.lower_bound)
+        if self.diag_beta_cap1 and self.allow_neg_eigval:
+            beta = beta.clamp_max(0.0)  # 2 sigmoid(b) <= 1
+        if self.diag_no_sign:
+            sign = None
         if self.forget_offset:
             g = g - self.forget_offset
             if self.safe_gate:
