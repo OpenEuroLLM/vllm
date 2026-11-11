@@ -343,6 +343,11 @@ class OellmXSAAttention(nn.Module):
         self.d = d
         self.rep = self.nh // self.nkv
         self.xsa, self.xsa_eps = config.exclusive_self_attention, config.xsa_eps
+        # recall-surgery diagnostics (default off): OELLM_ATTN_NO_XSA drops XSA,
+        # OELLM_ATTN_LOGIT_SCALE multiplies the softmax scale (sharper / flatter)
+        if os.environ.get("OELLM_ATTN_NO_XSA") == "1":
+            self.xsa = False
+        logit_scale = float(os.environ.get("OELLM_ATTN_LOGIT_SCALE", "1"))
         self.qkv_proj = QKVParallelLinear(
             h,
             d,
@@ -371,7 +376,7 @@ class OellmXSAAttention(nn.Module):
         self.attn = Attention(
             self.nh,
             d,
-            d**-0.5,
+            d**-0.5 * logit_scale,
             num_kv_heads=self.nkv,
             cache_config=vllm_config.cache_config,
             prefix=f"{prefix}.attn",
