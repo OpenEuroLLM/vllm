@@ -808,6 +808,21 @@ class OellmCKDA(MambaBase, nn.Module):
 
 
 # ----------------------------------------------------------------------- KronLSTM
+class OellmCkdaAttn(nn.Module):
+    """An ADDITIVE ckda_branch layer (the export's ``ckda_attn`` blocks): the CKDA
+    mixer (its state slot) and a parallel attention branch of the stack's kind (its
+    KV cache) on the same normalised input; the output is their sum (the branch's
+    weight is folded into ``attn.o_proj``)."""
+
+    def __init__(self, config, vllm_config: VllmConfig, prefix: str) -> None:
+        super().__init__()
+        self.ckda = OellmCKDA(config, vllm_config, f"{prefix}.ckda")
+        self.attn = OellmXSAAttention(config, vllm_config, f"{prefix}.attn")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.ckda(x) + self.attn(x)
+
+
 class OellmKronLSTM(MambaBase, nn.Module):
     """FLA ``KronLSTM`` (``fla.layers.kronlstm``) on the FLA kernels: a ckda_branch
     KronLSTM past its hand-over (Megatron megatron/core/ssm/ckda_branch.py; the HF
@@ -1844,6 +1859,8 @@ class OellmAmbitiousLayer(nn.Module):
             self.mixer = OellmCKDA(config, vllm_config, f"{prefix}.mixer")
         elif self.kind == "kronlstm":
             self.mixer = OellmKronLSTM(config, vllm_config, f"{prefix}.mixer")
+        elif self.kind == "ckda_attn":
+            self.mixer = OellmCkdaAttn(config, vllm_config, f"{prefix}.mixer")
         elif self.kind == "moe":
             self.mixer = OellmMoE(config, f"{prefix}.mixer")
         else:
@@ -1896,7 +1913,7 @@ class OellmAmbitiousLayer(nn.Module):
                     tuple(t.data_ptr() for t in self.mixer.kv_cache),
                 )
                 return self.ckda_graph(call, streams, idx, key=key)
-        if graph and self.kind not in ("ckda", "engram", "kronlstm"):
+        if graph and self.kind not in ("ckda", "engram", "kronlstm", "ckda_attn"):
             x, post, res = self.pre_graph(self._mhc_pre, streams)
             out = self.mixer(x)
             return self.post_graph(self._mhc_post, streams, out, post, res)
@@ -2174,6 +2191,25 @@ class OellmAmbitiousForCausalLM(nn.Module, HasInnerState, IsHybrid):
                     "g_proj.1.bias": "g_proj1.bias",
                     "o_norm.weight": "o_norm_weight",
                 }.get(tail, tail)
+            elif (
+                kind == "ckda_attn"
+            ):  # mixer.ckda.layer.* (CKDA) / mixer.attn.* (attention)
+                if tail.startswith("attn."):
+                    qkv = (("q_proj", "q"), ("k_proj", "k"), ("v_proj", "v"))
+                    for proj, sh in qkv:
+                        if tail == f"attn.{proj}.weight":
+                            return pre + "attn.qkv_proj.weight", sh
+                    return pre + tail, None
+                tail = tail.removeprefix("ckda.").removeprefix("layer.")
+                tail = {
+                    "f_proj.0.weight": "f_proj0.weight",
+                    "f_proj.1.weight": "f_proj1.weight",
+                    "g_proj.0.weight": "g_proj0.weight",
+                    "g_proj.1.weight": "g_proj1.weight",
+                    "g_proj.1.bias": "g_proj1.bias",
+                    "o_norm.weight": "o_norm_weight",
+                }.get(tail, tail)
+                return pre + "ckda." + tail, None
             elif kind == "kronlstm":
                 tail = tail.removeprefix("layer.")
                 if tail in ("qkv_proj.weight", "qkv_conv1d.weight"):
