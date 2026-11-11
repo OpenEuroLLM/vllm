@@ -1568,6 +1568,9 @@ class OellmEngram(MambaBase, nn.Module):
         self.hidden_norm = OellmRMSNorm(h, config.rms_norm_eps)
         self.key_norm = OellmRMSNorm(h, config.rms_norm_eps)
         self.signed_sqrt = config.engram_gate_signed_sqrt
+        # OELLM_ENGRAM_OUT_SCALE: multiplies the Engram layer's output (diagnostic:
+        # how much the hashed n-gram path drives a behaviour; 1 = as trained)
+        self.out_scale = float(os.environ.get("OELLM_ENGRAM_OUT_SCALE", "1"))
         self.conv_norm = (
             OellmRMSNorm(h, config.rms_norm_eps) if config.engram_conv_prenorm else None
         )
@@ -1800,6 +1803,8 @@ class OellmEngram(MambaBase, nn.Module):
                 conv_state[slot] = nst.to(conv_state.dtype)
                 id_state[slot] = nid
         y = F.silu(torch.cat(outs)) + vv
+        if self.out_scale != 1.0:
+            y = y * self.out_scale
         if n < t:
             y = torch.cat([y, y.new_zeros(t - n, y.shape[-1])])
         return y
