@@ -348,6 +348,12 @@ class OellmXSAAttention(nn.Module):
         if os.environ.get("OELLM_ATTN_NO_XSA") == "1":
             self.xsa = False
         logit_scale = float(os.environ.get("OELLM_ATTN_LOGIT_SCALE", "1"))
+        # OELLM_ATTN_ZERO_LAYERS: comma list of block indices whose attention output is
+        # zeroed (per-layer ablation; the KV cache is still written)
+        zero = os.environ.get("OELLM_ATTN_ZERO_LAYERS", "").strip()
+        parts = prefix.split(".")
+        idx = next((int(x) for x in reversed(parts) if x.isdigit()), -1)
+        self.zero_out = bool(zero) and idx in {int(x) for x in zero.split(",")}
         self.qkv_proj = QKVParallelLinear(
             h,
             d,
@@ -417,6 +423,8 @@ class OellmXSAAttention(nn.Module):
         elif gate is not None:
             o = (o.float() * gate).to(x.dtype)
         out, _ = self.o_proj(o.reshape(t, self.nh * self.d))
+        if self.zero_out:
+            out = torch.zeros_like(out)
         return out
 
 
