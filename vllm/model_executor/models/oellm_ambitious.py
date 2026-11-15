@@ -1232,6 +1232,14 @@ class OellmMoE(nn.Module):
         # loader does (bit-exact to the bf16 weights; checked at conversion)
         self.fp8_w8a16 = self.fp8 and os.environ.get("OELLM_MOE_FP8", "") == "w8a16"
         self._fp8_done = False
+        # OELLM_MOE_FP8_DIRECT=1 (with w8a16): the routed expert params are E4M3 from
+        # the start and the export's E4M3 bytes are copied in unchanged, so the bf16
+        # stacks (twice the bytes) never exist: no bf16 peak at load, in vLLM's memory
+        # profile or under the KV cache; they dequantize to the bf16 weights of the
+        # default path, as _to_fp8 checks
+        self.fp8_direct = (
+            self.fp8_w8a16 and os.environ.get("OELLM_MOE_FP8_DIRECT", "0") == "1"
+        )
         self.impl = os.environ.get("OELLM_MOE", "fused")
         assert self.impl in ("fused", "naive"), self.impl
         self.local_expert_ids = None
@@ -1281,6 +1289,12 @@ class OellmMoE(nn.Module):
                     group.rank_in_group,
                     pc.expert_placement_strategy,
                 )
+            if self.fp8_direct:
+                for n, p in self.experts.named_parameters():
+                    if n.endswith("w13_weight") or n.endswith("w2_weight"):
+                        p.data = torch.empty(
+                            p.shape, dtype=torch.float8_e4m3fn, device=p.device
+                        )
         else:
             assert e % self.tp == 0, f"{e} experts do not divide over {self.tp} ranks"
             self.local = e // self.tp
@@ -1340,7 +1354,9 @@ class OellmMoE(nn.Module):
             q, sc = pending.pop(base), pending.pop(base + "_scale")
             if self.fp8_w8a16:  # the scales for the weight-only FP8 kernel (_to_fp8)
                 self.__dict__.setdefault("_fp8_scales", {})[base] = sc
-            if self.impl == "naive":
+            if self.fp8_direct:
+                w = q.view(torch.float8_e4m3fn)
+            elif self.impl == "naive":
                 w = _Fp8Experts(q, sc, self.block)
             else:  # this rank's experts, dequantized on the GPU of the FusedMoE weights
                 dev = next(self.experts.parameters()).device
@@ -1390,6 +1406,27 @@ class OellmMoE(nn.Module):
         self._fp8_done = True
         scales = self.__dict__.pop("_fp8_scales", {})
         params = dict(self.experts.named_parameters())
+        if self.fp8_direct:
+            ids = (
+                sorted(self.local_expert_ids)
+                if self.local_expert_ids is not None
+                else list(range(self.num_experts))
+            )
+            for name, suffix in (
+                ("gate_up_proj", "w13_weight"),
+                ("down_proj", "w2_weight"),
+            ):
+                ((_, param),) = [
+                    (n, p) for n, p in params.items() if n.endswith(suffix)
+                ]
+                assert param.dtype == torch.float8_e4m3fn, param.dtype
+                sc = (
+                    scales[name][torch.tensor(ids)]
+                    .to(param.device, torch.float32)
+                    .contiguous()
+                )
+                register_fp8_w8a16(param.data, sc, self.block)
+            return
         for name, suffix in (
             ("gate_up_proj", "w13_weight"),
             ("down_proj", "w2_weight"),
