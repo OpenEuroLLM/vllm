@@ -853,6 +853,27 @@ class OellmCkdaAttn(nn.Module):
         return self.ckda(x) + self.attn(x)
 
 
+class OellmCkdaKVShare(nn.Module):
+    """An ADDITIVE kvshare ckda_branch layer (the export's ``ckda_kvshare`` blocks):
+    the CKDA mixer (its state slot) and a kvshare attention branch -- q (+ output
+    gate) / q-norm / ``o_proj`` of its own over the source attention layer's keys /
+    values (``kv_share_sources``; no KV cache of its own) -- on the same normalised
+    input; the output is their sum (the branch's weight is folded into
+    ``attn.o_proj``)."""
+
+    def __init__(
+        self, config, vllm_config: VllmConfig, prefix: str, source_prefix: str
+    ) -> None:
+        super().__init__()
+        self.ckda = OellmCKDA(config, vllm_config, f"{prefix}.ckda")
+        self.attn = OellmKVShareAttention(
+            config, vllm_config, f"{prefix}.attn", source_prefix
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.ckda(x) + self.attn(x)
+
+
 class OellmKronLSTM(MambaBase, nn.Module):
     """FLA ``KronLSTM`` (``fla.layers.kronlstm``) on the FLA kernels: a ckda_branch
     KronLSTM past its hand-over (Megatron megatron/core/ssm/ckda_branch.py; the HF
@@ -1933,6 +1954,14 @@ class OellmAmbitiousLayer(nn.Module):
             self.mixer = OellmKronLSTM(config, vllm_config, f"{prefix}.mixer")
         elif self.kind == "ckda_attn":
             self.mixer = OellmCkdaAttn(config, vllm_config, f"{prefix}.mixer")
+        elif self.kind == "ckda_kvshare":
+            src = int(config.kv_share_sources[str(layer_idx)])
+            self.mixer = OellmCkdaKVShare(
+                config,
+                vllm_config,
+                f"{prefix}.mixer",
+                f"{prefix.rsplit('.', 1)[0]}.{src}.mixer",
+            )
         elif self.kind == "moe":
             self.mixer = OellmMoE(config, f"{prefix}.mixer")
         else:
@@ -1985,7 +2014,9 @@ class OellmAmbitiousLayer(nn.Module):
                     tuple(t.data_ptr() for t in self.mixer.kv_cache),
                 )
                 return self.ckda_graph(call, streams, idx, key=key)
-        if graph and self.kind not in ("ckda", "engram", "kronlstm", "ckda_attn"):
+        if graph and self.kind not in (
+            "ckda", "engram", "kronlstm", "ckda_attn", "ckda_kvshare"
+        ):
             x, post, res = self.pre_graph(self._mhc_pre, streams)
             out = self.mixer(x)
             return self.post_graph(self._mhc_post, streams, out, post, res)
@@ -2048,7 +2079,11 @@ class OellmAmbitiousModel(nn.Module):
             source = self.layers[int(src)].mixer
             assert isinstance(source, OellmXSAAttention) and int(src) < int(i)
             source.keep_v = True
-            self.layers[int(i)].mixer._source.append(source)
+            mixer = self.layers[int(i)].mixer
+            # ckda_kvshare: the branch (attn) of the additive layer reads the source
+            if isinstance(mixer, OellmCkdaKVShare):
+                mixer = mixer.attn
+            mixer._source.append(source)
         self.norm = OellmRMSNorm(
             config.hidden_size,
             config.rms_norm_eps,
@@ -2271,6 +2306,20 @@ class OellmAmbitiousForCausalLM(nn.Module, HasInnerState, IsHybrid):
                     for proj, sh in qkv:
                         if tail == f"attn.{proj}.weight":
                             return pre + "attn.qkv_proj.weight", sh
+                    return pre + tail, None
+                tail = tail.removeprefix("ckda.").removeprefix("layer.")
+                tail = {
+                    "f_proj.0.weight": "f_proj0.weight",
+                    "f_proj.1.weight": "f_proj1.weight",
+                    "g_proj.0.weight": "g_proj0.weight",
+                    "g_proj.1.weight": "g_proj1.weight",
+                    "g_proj.1.bias": "g_proj1.bias",
+                    "o_norm.weight": "o_norm_weight",
+                }.get(tail, tail)
+                return pre + "ckda." + tail, None
+            elif kind == "ckda_kvshare":
+                # mixer.ckda.layer.* (CKDA) / mixer.attn.{q,gate,o}_proj, q_norm (branch)
+                if tail.startswith("attn."):
                     return pre + tail, None
                 tail = tail.removeprefix("ckda.").removeprefix("layer.")
                 tail = {
