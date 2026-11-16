@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference fusions preserving the eager model's BF16 rounding boundaries."""
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -122,6 +124,11 @@ def _side_stream(device) -> torch.cuda.Stream:
     return _SIDE[device]
 
 
+# warps of the _mhc_read program (one token per program): 2 instead of 8 halves the time
+# of prefill-sized calls (micro-benchmark, unsplit path bit-identical)
+_MHC_READ_WARPS = int(os.environ.get("OELLM_MHC_READ_WARPS", "2"))
+
+
 def mhc_read(
     streams,
     phi,
@@ -174,7 +181,7 @@ def mhc_read(
             iters,
             triton.next_power_of_2(h),
             part,
-            num_warps=8,
+            num_warps=_MHC_READ_WARPS,
             enable_fp_fusion=False,
         )
 
@@ -213,6 +220,41 @@ def _mhc_write(S, OUT, POST, RES, Y, H: tl.constexpr, BLOCK: tl.constexpr):
     tl.store(Y + t * 4 * H + j * H + h, mixed + weighted, h < H)
 
 
+@triton.jit
+def _mhc_write4(S, OUT, POST, RES, Y, H: tl.constexpr, BLOCK: tl.constexpr):
+    # _mhc_write with all four output streams per program: the 4 x BLOCK stream tile and
+    # the sublayer output are loaded once instead of once per output stream (same
+    # arithmetic per stream)
+    t, tile = tl.program_id(0), tl.program_id(1)
+    h = tile * BLOCK + tl.arange(0, BLOCK)
+    s = tl.arange(0, 4)
+    dtype = S.dtype.element_ty
+    stream = tl.load(S + t * 4 * H + s[:, None] * H + h[None, :], h[None, :] < H, 0).to(
+        tl.float32
+    )
+    out = tl.load(OUT + t * H + h, h < H, 0).to(tl.float32)
+    for j in tl.static_range(4):
+        res = tl.load(RES + t * 16 + j * 4 + s).to(dtype).to(tl.float32)
+        mixed = (
+            tl.sum((res[:, None] * stream).to(dtype).to(tl.float32), 0)
+            .to(dtype)
+            .to(tl.float32)
+        )
+        post = tl.load(POST + t * 4 + j).to(dtype).to(tl.float32)
+        weighted = (post * out).to(dtype).to(tl.float32)
+        tl.store(Y + t * 4 * H + j * H + h, mixed + weighted, h < H)
+
+
+# _mhc_write4 is bit-identical to _mhc_write and ~2x faster on prefill-sized steps
+# (_mhc_write's 256-wide per-stream tile reads the stream tile 4x); OELLM_MHC_WRITE4=0
+# keeps _mhc_write, OELLM_MHC_WRITE4_CHECK=1 compares both once per worker and logs the
+# result
+_MHC_WRITE4 = os.environ.get("OELLM_MHC_WRITE4", "1") == "1"
+_MHC_WRITE4_BLOCK = int(os.environ.get("OELLM_MHC_WRITE4_BLOCK", "512"))
+_MHC_WRITE4_WARPS = int(os.environ.get("OELLM_MHC_WRITE4_WARPS", "4"))
+_MHC_WRITE4_CHECK = [os.environ.get("OELLM_MHC_WRITE4_CHECK", "0") == "1"]
+
+
 def mhc_write(streams, out, pending):
     tokens, n, h = streams.shape
     assert n == 4 and streams.is_contiguous() and out.is_contiguous()
@@ -221,7 +263,33 @@ def mhc_write(streams, out, pending):
         torch.cuda.current_stream().wait_event(pending[2])
     y = torch.empty_like(streams)
     if tokens:
-        _mhc_write[(tokens, n, triton.cdiv(h, 256))](
-            streams, out, post, res, y, h, 256, enable_fp_fusion=False
-        )
+        if _MHC_WRITE4:
+            _mhc_write4[(tokens, triton.cdiv(h, _MHC_WRITE4_BLOCK))](
+                streams,
+                out,
+                post,
+                res,
+                y,
+                h,
+                _MHC_WRITE4_BLOCK,
+                num_warps=_MHC_WRITE4_WARPS,
+                enable_fp_fusion=False,
+            )
+            if _MHC_WRITE4_CHECK[0]:
+                _MHC_WRITE4_CHECK[0] = False
+                ref = torch.empty_like(streams)
+                _mhc_write[(tokens, n, triton.cdiv(h, 256))](
+                    streams, out, post, res, ref, h, 256, enable_fp_fusion=False
+                )
+                import logging
+
+                logging.getLogger("vllm").warning(
+                    "OELLM_MHC_WRITE4 check: %d tokens, same bits as _mhc_write: %s",
+                    tokens,
+                    bool(torch.equal(y, ref)),
+                )
+        else:
+            _mhc_write[(tokens, n, triton.cdiv(h, 256))](
+                streams, out, post, res, y, h, 256, enable_fp_fusion=False
+            )
     return y
