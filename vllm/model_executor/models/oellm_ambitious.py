@@ -115,6 +115,30 @@ def _decode_graph_enabled():
     )
 
 
+# OELLM_CKDA_SPLIT=1: mixed steps run the decode tokens through the in-place recurrent
+# kernel and only the prefills through the chunk kernel (default off: the decode tokens'
+# rounding differs from the chunk kernel's)
+_CKDA_SPLIT = os.environ.get("OELLM_CKDA_SPLIT", "0") == "1"
+# prefill n-gram hashes through the Triton decode hash kernel when the decode kernels
+# are on (the same integer arithmetic as _rows); OELLM_ENGRAM_HASH_PREFILL=0 keeps the
+# per-order torch path, OELLM_ENGRAM_HASH_PREFILL_CHECK=1 compares both once per worker
+# and logs the result
+_ENGRAM_HASH_PREFILL = os.environ.get("OELLM_ENGRAM_HASH_PREFILL", "1") == "1"
+_ENGRAM_HASH_PREFILL_CHECK = [
+    os.environ.get("OELLM_ENGRAM_HASH_PREFILL_CHECK", "0") == "1"
+]
+# The CKDA prefill passes one int64 cu_seqlens object per step to all its layers, so
+# FLA's identity-keyed tensor_cache (prepare_chunk_indices, offsets, ...) computes, and
+# syncs, once per step instead of once per layer
+_CU_LONG: list = [None, None]
+
+
+def _cu_long(cu: torch.Tensor) -> torch.Tensor:
+    if _CU_LONG[0] is not cu:
+        _CU_LONG[0], _CU_LONG[1] = cu, cu.long()
+    return _CU_LONG[1]
+
+
 class OellmRMSNorm(nn.Module):
     """fp32 reductions, ``(w * x_hat).to(dtype)``; ``zero_centered``: the weight
     holds gamma - 1."""
@@ -783,10 +807,72 @@ class OellmCKDA(MambaBase, nn.Module):
                 sign_decode=None if sign is None else sign.contiguous(),
             )
             return self._finish(o, v, gate_out, n, t)
+        if (
+            prefill
+            and _CKDA_SPLIT
+            and m.num_decodes > 0
+            and decode_kernels.enabled("ckda_inplace")
+            and x.is_cuda
+        ):
+            # mixed step: the decode tokens (the front slice, as the GDN metadata orders
+            # them) run the in-place recurrent decode kernel by state slot, and only the
+            # prefill sequences go through the chunk kernel, so only their states are
+            # gathered and written back
+            from fla.ops.kda.fused_recurrent import fused_recurrent_kda_fwd
+
+            nd = m.num_decode_tokens
+            o_d, _ = fused_recurrent_kda_fwd(
+                q=q[:, :nd].contiguous(),
+                k=k[:, :nd].contiguous(),
+                v=v[:, :nd].contiguous(),
+                g=g[:, :nd].contiguous(),
+                beta=beta[:, :nd].contiguous(),
+                scale=self.head_dim**-0.5,
+                initial_state=rec_state,
+                inplace_final_state=True,
+                state_v_first=True,
+                cu_seqlens=self._decode_cu(nd, x.device),
+                ssm_state_indices=idx[:nd],
+                use_qk_l2norm_in_kernel=True,
+                use_gate_in_kernel=False,
+                use_beta_sigmoid_in_kernel=True,
+                allow_neg_eigval=self.allow_neg_eigval,
+                lower_bound=self.lower_bound,
+                sign_decode=None if sign is None else sign[:, :nd].contiguous(),
+            )
+            pidx = m.prefill_state_indices
+            init = rec_state[pidx]
+            keep = m.prefill_has_initial_state.view(-1, *([1] * (init.dim() - 1)))
+            init = torch.where(keep, init, torch.zeros_like(init))
+            o_p, final = chunk_kda(
+                q=q[:, nd:],
+                k=k[:, nd:],
+                v=v[:, nd:],
+                g=g[:, nd:],
+                beta=beta[:, nd:],
+                sign=None if sign is None else sign[:, nd:],
+                scale=self.head_dim**-0.5,
+                initial_state=init,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+                use_gate_in_kernel=False,
+                use_beta_sigmoid_in_kernel=True,
+                allow_neg_eigval=self.allow_neg_eigval,
+                lower_bound=self.lower_bound,
+                state_v_first=True,
+                cu_seqlens=_cu_long(m.prefill_query_start_loc),
+                safe_gate=self.safe_gate,
+            )
+            rec_state[pidx[: final.shape[0]]] = final.to(rec_state.dtype)
+            o = torch.cat([o_d, o_p], dim=1)
+            return self._finish(o, v, gate_out, n, t)
         if prefill:
             cu = m.non_spec_query_start_loc
-            init = rec_state[idx].clone()
-            init[~m.has_initial_state] = 0
+            init = rec_state[idx]
+            # torch.where instead of a boolean-mask write (index_put needs nonzero(): a
+            # host sync)
+            keep = m.has_initial_state.view(-1, *([1] * (init.dim() - 1)))
+            init = torch.where(keep, init, torch.zeros_like(init))
         else:
             cu = torch.arange(n + 1, device=x.device, dtype=torch.int32)
             init = rec_state[idx[:n]].clone()
@@ -808,7 +894,7 @@ class OellmCKDA(MambaBase, nn.Module):
             allow_neg_eigval=self.allow_neg_eigval,
             lower_bound=self.lower_bound,
             state_v_first=True,
-            cu_seqlens=cu.long(),
+            cu_seqlens=_cu_long(cu) if prefill else cu.long(),
             **extra,
         )
         rec_state[idx[: final.shape[0]]] = final.to(rec_state.dtype)
@@ -1136,8 +1222,11 @@ class OellmKronLSTM(MambaBase, nn.Module):
                 target_gate = target_gate * 0.5
         if prefill:
             cu = m.non_spec_query_start_loc
-            init = rec_state[idx].clone()
-            init[~m.has_initial_state] = 0
+            init = rec_state[idx]
+            # torch.where instead of a boolean-mask write (index_put needs nonzero(): a
+            # host sync)
+            keep = m.has_initial_state.view(-1, *([1] * (init.dim() - 1)))
+            init = torch.where(keep, init, torch.zeros_like(init))
             kernel = chunk_kronlstm
         else:
             cu = torch.arange(n + 1, device=x.device, dtype=torch.int32)
@@ -1788,6 +1877,39 @@ class OellmEngram(MambaBase, nn.Module):
         state)."""
         shifted = torch.cat([id_state, ids.long() + 1])
         s = ids.shape[0]
+        if (
+            _ENGRAM_HASH_PREFILL
+            and decode_kernels.enabled("engram_hash")
+            and shifted.is_cuda
+        ):
+            # one window [id_state.., id] per token, hashed by the decode Triton kernel:
+            # the same integer arithmetic as _rows without ~orders x heads x n small
+            # kernels per request
+            win = shifted.unfold(0, self.hist + 1, 1)
+            n = len(self.sizes)
+            rows = self._rows_decode(win, self.hash_mult, self.sizes, self.offsets)
+            signs = (
+                self._rows_decode(win, self.sign_mult, [self.sign_size] * n, [0] * n)
+                if self.sign_hash
+                else None
+            )
+            if _ENGRAM_HASH_PREFILL_CHECK[0]:
+                _ENGRAM_HASH_PREFILL_CHECK[0] = False
+                ref = self._rows(shifted, s, self.hash_mult, self.sizes, self.offsets)
+                same = bool(torch.equal(rows, ref))
+                if self.sign_hash:
+                    refs = self._rows(
+                        shifted, s, self.sign_mult, [self.sign_size] * n, [0] * n
+                    )
+                    same = same and bool(torch.equal(signs, refs))
+                import logging
+
+                logging.getLogger("vllm").warning(
+                    "OELLM_ENGRAM_HASH_PREFILL check: %d tokens, same as _rows: %s",
+                    s,
+                    same,
+                )
+            return rows, signs, shifted[shifted.shape[0] - self.hist :]
         rows = self._rows(shifted, s, self.hash_mult, self.sizes, self.offsets)
         signs = None
         if self.sign_hash:
