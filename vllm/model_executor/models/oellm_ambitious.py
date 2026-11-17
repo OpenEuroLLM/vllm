@@ -2065,6 +2065,15 @@ class OellmAmbitiousLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.kind = config.block_types[layer_idx]
+        # v_block_learnable_gate: an inserted V layer's learned residual gate rho
+        # (g_v is already folded into o_proj at export). None for every other layer
+        # and for a checkpoint without the gates.
+        self.res_gate = None
+        if self.kind == "kvshare":
+            gate = (getattr(config, "kv_share_res_gate", None) or {}).get(
+                str(layer_idx)
+            )
+            self.res_gate = None if gate is None else float(gate)
         self.pre_graph = DecodeGraph()
         self.post_graph = DecodeGraph()
         self.ckda_graph = DecodeGraph()
@@ -2074,11 +2083,11 @@ class OellmAmbitiousLayer(nn.Module):
         else:
             self.mhc = OellmMHC(config)
         zcg = config.layernorm_zero_centered_gamma
-        # Engram normalises internally; a pre-§22.18 V layer (kv_share_input_norm False) has no input norm
-        # either (docs/recall_surgery_ambitious.md §22.18) -- Identity keeps the two call sites below plain
+        # Engram normalises internally; a pre-§22.18 V layer (kv_share_input_norm
+        # False) has no input norm either (docs/recall_surgery_ambitious.md §22.18)
+        # -- Identity keeps the two call sites below plain
         if self.kind == "engram" or (
-            self.kind == "kvshare"
-            and not getattr(config, "kv_share_input_norm", True)
+            self.kind == "kvshare" and not getattr(config, "kv_share_input_norm", True)
         ):
             self.input_layernorm = nn.Identity()
         else:
@@ -2162,7 +2171,11 @@ class OellmAmbitiousLayer(nn.Module):
                 )
                 return self.ckda_graph(call, streams, idx, key=key)
         if graph and self.kind not in (
-            "ckda", "engram", "kronlstm", "ckda_attn", "ckda_kvshare"
+            "ckda",
+            "engram",
+            "kronlstm",
+            "ckda_attn",
+            "ckda_kvshare",
         ):
             x, post, res = self.pre_graph(self._mhc_pre, streams)
             out = self.mixer(x)
@@ -2173,12 +2186,26 @@ class OellmAmbitiousLayer(nn.Module):
         x, (post, res) = self.mhc.read(streams)
         return self.input_layernorm(x), post, res
 
+    def _gated(self, res: torch.Tensor) -> torch.Tensor:
+        """The learnable residual gate of an inserted V layer.
+
+        rho pulls the stream mixer toward the identity:
+        streams' = (1 - rho) streams + rho (h_res @ streams) + h_post^T out
+        (docs/v4b_plan.md)."""
+        if self.res_gate is None:
+            return res
+        eye = torch.eye(res.shape[-1], dtype=res.dtype, device=res.device)
+        return torch.lerp(eye, res, self.res_gate)
+
     def _mhc_post(self, streams, out, post, res):
-        return self.mhc.write(streams, out, (post, res))
+        return self.mhc.write(streams, out, (post, self._gated(res)))
 
     def _mhc_forward(self, streams, input_ids):
         x, pending = self.mhc.read(streams)
-        return self.mhc.write(streams, self._sublayer(x, input_ids), pending)
+        post, res = pending
+        return self.mhc.write(
+            streams, self._sublayer(x, input_ids), (post, self._gated(res))
+        )
 
 
 class OellmEmbedNorm(nn.Module):
@@ -2296,6 +2323,7 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     "fla_layer_kronlstm": None,
     "kv_share_sources": {},
     "kv_share_input_norm": True,
+    "kv_share_res_gate": {},
     "ldm_groups": 16,
     "ldm_key_dim": 8,
     "ldm_hidden_dim": 32,
@@ -2466,7 +2494,7 @@ class OellmAmbitiousForCausalLM(nn.Module, HasInnerState, IsHybrid):
                 }.get(tail, tail)
                 return pre + "ckda." + tail, None
             elif kind == "ckda_kvshare":
-                # mixer.ckda.layer.* (CKDA) / mixer.attn.{q,gate,o}_proj, q_norm (branch)
+                # mixer.ckda.layer.* (CKDA) / mixer.attn.{q,gate,o}_proj, q_norm
                 if tail.startswith("attn."):
                     return pre + tail, None
                 tail = tail.removeprefix("ckda.").removeprefix("layer.")
