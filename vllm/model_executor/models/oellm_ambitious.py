@@ -2074,7 +2074,14 @@ class OellmAmbitiousLayer(nn.Module):
         else:
             self.mhc = OellmMHC(config)
         zcg = config.layernorm_zero_centered_gamma
-        if self.kind != "engram":
+        # Engram normalises internally; a pre-§22.18 V layer (kv_share_input_norm False) has no input norm
+        # either (docs/recall_surgery_ambitious.md §22.18) -- Identity keeps the two call sites below plain
+        if self.kind == "engram" or (
+            self.kind == "kvshare"
+            and not getattr(config, "kv_share_input_norm", True)
+        ):
+            self.input_layernorm = nn.Identity()
+        else:
             self.input_layernorm = OellmRMSNorm(
                 config.hidden_size, config.rms_norm_eps, zcg
             )
@@ -2288,6 +2295,7 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     "residual": "mhc",
     "fla_layer_kronlstm": None,
     "kv_share_sources": {},
+    "kv_share_input_norm": True,
     "ldm_groups": 16,
     "ldm_key_dim": 8,
     "ldm_hidden_dim": 32,
