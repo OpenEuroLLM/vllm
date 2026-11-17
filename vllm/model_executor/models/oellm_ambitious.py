@@ -848,9 +848,18 @@ class OellmCkdaAttn(nn.Module):
         super().__init__()
         self.ckda = OellmCKDA(config, vllm_config, f"{prefix}.ckda")
         self.attn = OellmXSAAttention(config, vllm_config, f"{prefix}.attn")
+        self.serial = bool(getattr(config, "ckda_branch_serial", False))
+        self.hidden_size = config.hidden_size
+        self.norm_eps = config.rms_norm_eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.ckda(x) + self.attn(x)
+        y = self.ckda(x)
+        attn_x = (
+            F.layer_norm(y, (self.hidden_size,), eps=self.norm_eps)
+            if self.serial
+            else x
+        )
+        return y + self.attn(attn_x)
 
 
 class OellmCkdaKVShare(nn.Module):
@@ -869,9 +878,18 @@ class OellmCkdaKVShare(nn.Module):
         self.attn = OellmKVShareAttention(
             config, vllm_config, f"{prefix}.attn", source_prefix
         )
+        self.serial = bool(getattr(config, "ckda_branch_serial", False))
+        self.hidden_size = config.hidden_size
+        self.norm_eps = config.rms_norm_eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.ckda(x) + self.attn(x)
+        y = self.ckda(x)
+        attn_x = (
+            F.layer_norm(y, (self.hidden_size,), eps=self.norm_eps)
+            if self.serial
+            else x
+        )
+        return y + self.attn(attn_x)
 
 
 class OellmKronLSTM(MambaBase, nn.Module):
