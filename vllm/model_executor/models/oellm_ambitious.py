@@ -2069,6 +2069,9 @@ class OellmAmbitiousLayer(nn.Module):
         # (g_v is already folded into o_proj at export). None for every other layer
         # and for a checkpoint without the gates.
         self.res_gate = None
+        # the identity of _gated, cached per (n, device, dtype): _gated runs inside the decode graph
+        # (_mhc_post), so it must not allocate a fresh eye on every call
+        self._eyes: dict[tuple, torch.Tensor] = {}
         if self.kind == "kvshare":
             gate = (getattr(config, "kv_share_res_gate", None) or {}).get(
                 str(layer_idx)
@@ -2194,7 +2197,12 @@ class OellmAmbitiousLayer(nn.Module):
         (docs/v4b_plan.md)."""
         if self.res_gate is None:
             return res
-        eye = torch.eye(res.shape[-1], dtype=res.dtype, device=res.device)
+        key = (res.shape[-1], res.device, res.dtype)
+        eye = self._eyes.get(key)
+        if eye is None:
+            eye = self._eyes[key] = torch.eye(
+                res.shape[-1], dtype=res.dtype, device=res.device
+            )
         return torch.lerp(eye, res, self.res_gate)
 
     def _mhc_post(self, streams, out, post, res):
